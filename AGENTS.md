@@ -17,15 +17,15 @@ Ask only when a missing decision blocks the current task; continue independent w
 
 ## Language and communication
 
-- Use simple, clear level B1 English.
-- Use English for all project content: code, identifiers, comments, documentation, tests, test names, fixtures written for this project, logs, error messages, configuration descriptions, commit messages, and pull requests.
+- Use simple, clear language. Use level B1 English where English is required.
+- Use English for code, identifiers, code comments, tests, test names, fixtures written for this project, logs, error messages, commit messages, and pull requests.
 - Communicate with the user in Russian unless requested otherwise. Be brief, direct, and factual. Explain unnecessary complexity or incorrect assumptions without motivational filler.
 - Keep code, comments, and project reports neutral and professional.
-- Write new documentation and documentation updates in English. Preserve the meaning of existing requirements when translating them.
+- Write all documents and specifications, including configuration descriptions, in Russian. Write new documentation and documentation updates in Russian. Preserve the meaning of existing requirements when translating them.
 
 ## Specifications
 
-Write specifications in simple English at B1 level. Use short sentences and explain technical terms when needed. Describe what will change and why without repeating the same rule in several sections.
+Write specifications in simple Russian, with Russian section headings. Use short sentences and explain technical terms when needed. Describe what will change and why without repeating the same rule in several sections.
 
 Use the following section order. Required sections must be present. Add optional sections only when they have useful content; do not add empty placeholders.
 
