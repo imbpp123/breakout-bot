@@ -1,13 +1,14 @@
 //@version=6
 indicator("Pivot levels — ATR zones v2", overlay = true, max_bars_back = 5000, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 50)
 
-// Publish the updated library as version 2 before loading this indicator.
-import imbpp123/PivotLevels/3 as levels
+// Publish the updated library first; match this import to its actual version.
+import imbpp123/PivotLevels/4 as levels
 
 int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000)
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50)
 string pivotSource = input.string("High/Low", "Pivot source", options = ["High/Low", "Body"])
 string extremeMethod = input.string("Forward", "Extreme search method", options = ["Forward", "Backward"])
+bool filterCoveredExtremes = input.bool(false, "Filter covered extremes")
 bool showPivots = input.bool(true, "Show all confirmed pivots")
 bool showSwings = input.bool(true, "Connect selected extremes")
 bool showLevels = input.bool(true, "Show ATR zones")
@@ -55,7 +56,7 @@ f_visibleZones(array<levels.Zone> zones, array<levels.Extreme> fixed, bool bound
         for i = 0 to array.size(zones) - 1
             levels.Zone zone = array.get(zones, i)
             float boundary = zone.side == -1 ? lowest : highest
-            if not boundariesOnly or (not na(boundary) and zone.bottom <= boundary and boundary <= zone.top)
+            if zone.members >= 2 and (not boundariesOnly or (not na(boundary) and zone.bottom <= boundary and boundary <= zone.top))
                 array.push(visible, i)
                 if array.size(visible) > limit
                     array.shift(visible)
@@ -131,6 +132,8 @@ f_structureTests() =>
 f_visibilityTests() =>
     array<levels.Extreme> fixed = array.from(levels.Extreme.new(80, 0, -1, 5), levels.Extreme.new(140, 1, 1, 6), levels.Extreme.new(100, 2, -1, 7), levels.Extreme.new(120, 3, 1, 8))
     array<levels.Zone> zones = array.from(levels.Zone.new(99, 100, -1), levels.Zone.new(120, 121, 1), levels.Zone.new(109, 111, -1), levels.Zone.new(119, 121, -1))
+    for zone in zones
+        zone.members := 2
     array<int> boundary = f_visibleZones(zones, fixed, true, 2, 20)
     f_assert(array.size(boundary) == 2 and array.get(boundary, 0) == 0 and array.get(boundary, 1) == 1, "Recent boundaries include edges and reject internal or opposite-side zones")
     array<int> all = f_visibleZones(zones, fixed, false, 2, 2)
@@ -144,6 +147,28 @@ f_visibilityTests() =>
     f_assert(array.size(f_visibleZones(zones, array.new<levels.Extreme>(), true, 10, 20)) == 0, "Empty extremes have no boundary zones")
     f_assert(array.size(f_visibleZones(array.new<levels.Zone>(), fixed, true, 10, 20)) == 0, "Empty zones stay empty")
     f_assert(array.size(zones) == 4 and array.size(fixed) == 4 and array.get(zones, 0).bottom == 99, "Display filter leaves source data unchanged")
+    array<levels.Zone> singleton = array.from(levels.Zone.new(100, 100, -1, members = 1))
+    f_assert(array.size(f_visibleZones(singleton, fixed, false, 2, 20)) == 0, "Single extreme does not form a displayed zone")
+    true
+
+f_coveredTests() =>
+    array<levels.Extreme> points = array.from(levels.Extreme.new(100, 10, -1, 13, 2), levels.Extreme.new(120, 11, 1, 14, 3), levels.Extreme.new(95, 12, -1, 14, 4), levels.Extreme.new(125, 13, 1, 14, 5))
+    array<float> lows = array.from(100.0, 110.0, 95.0, 110.0, 105.0)
+    array<float> highs = array.from(110.0, 120.0, 115.0, 125.0, 120.0)
+    array<levels.Extreme> visible = levels.extreme_filterCovered(points, lows, highs, 10)
+    f_assert(array.size(visible) == 2 and array.get(visible, 0).index == 12 and array.get(visible, 1).index == 13, "Later bodies cover both sides and preserve chronological order")
+    f_assert(array.get(visible, 0).fixedAt == 14 and array.get(visible, 0).atr == 4, "Filter preserves extreme metadata")
+    levels.Extreme copied = array.get(visible, 0)
+    copied.price := 1
+    f_assert(array.size(points) == 4 and array.get(points, 2).price == 95 and array.get(lows, 2) == 95, "Filter returns independent copies and leaves inputs unchanged")
+    array<levels.Extreme> equal = array.from(levels.Extreme.new(100, 10, -1, 12), levels.Extreme.new(120, 10, 1, 12))
+    array<levels.Extreme> kept = levels.extreme_filterCovered(equal, array.from(90.0, 100.0), array.from(130.0, 120.0), 10)
+    f_assert(array.size(kept) == 2, "Own body is ignored and later equal bodies keep both sides")
+    array<levels.Extreme> newest = levels.extreme_filterCovered(array.from(levels.Extreme.new(110, 11, 1, 11)), array.from(80.0, 90.0), array.from(150.0, 140.0), 10)
+    f_assert(array.size(newest) == 1, "Earlier candles and own candle cannot cover newest extreme")
+    array<levels.Extreme> crossed = levels.extreme_filterCovered(equal, array.from(100.0, 99.0), array.from(120.0, 121.0), 10)
+    f_assert(array.size(crossed) == 0, "Any later closed body can cover an extreme before its confirmation")
+    f_assert(array.size(levels.extreme_filterCovered(array.new<levels.Extreme>(), array.new<float>(), array.new<float>(), 0)) == 0, "Empty input returns empty output")
     true
 
 f_unitTests() =>
@@ -340,6 +365,7 @@ if runTests
     f_collectionTests()
 
 if barstate.isfirst and runTests
+    f_coveredTests()
     f_pivotSourceTests()
     f_markerTests()
     f_visibilityTests()
@@ -350,11 +376,18 @@ if barstate.isfirst and runTests
 
 float zoneAtr = ta.atr(zoneAtrLength)
 var array<levels.Pivot> pivots = array.new<levels.Pivot>()
+var array<float> bodyLows = array.new<float>()
+var array<float> bodyHighs = array.new<float>()
 var int lastClosed = na
 [pivotHighSource, pivotLowSource] = f_pivotSources(open, high, low, close, pivotSource == "Body")
 levels.pivot_collect(pivots, pivotHighSource, pivotLowSource, zoneAtr, pivotSpan, barstate.isconfirmed, bar_index)
 if barstate.isconfirmed
     lastClosed := bar_index
+    array.push(bodyLows, math.min(open, close))
+    array.push(bodyHighs, math.max(open, close))
+    if array.size(bodyLows) > historyBars
+        array.shift(bodyLows)
+        array.shift(bodyHighs)
     levels.pivot_pruneWindow(pivots, bar_index - historyBars + 1)
 
 [hasHigh, hasLow] = f_confirmedPivotSides(pivots, bar_index)
@@ -367,7 +400,7 @@ plotshape(rawVisible and hasLow, "Raw pivot low", shape.triangleup, location.bel
 var array<line> drawnLines = array.new<line>()
 var array<box> drawnBoxes = array.new<box>()
 var array<label> drawnLabels = array.new<label>()
-var table debug = table.new(position.top_right, 2, 15, bgcolor = color.new(color.black, 10), border_width = 1)
+var table debug = table.new(position.top_right, 2, 16, bgcolor = color.new(color.black, 10), border_width = 1)
 
 f_row(table panel, int row, string name, string value) =>
     table.cell(panel, 0, row, name, text_color = color.silver, text_halign = text.align_left, text_size = size.small)
@@ -385,22 +418,23 @@ if barstate.islastconfirmedhistory or barstate.islast
     array.clear(drawnLabels)
     bool backward = extremeMethod == "Backward"
     levels.Result result = backward ? levels.extreme_findBackward(pivots, lastClosed) : levels.extreme_findForward(pivots)
-    array<levels.Zone> zones = levels.zone_build(result.fixed, zoneAtrFactor)
+    array<levels.Extreme> selected = filterCoveredExtremes ? levels.extreme_filterCovered(result.fixed, bodyLows, bodyHighs, lastClosed - array.size(bodyLows) + 1) : result.fixed
+    array<levels.Zone> zones = levels.zone_build(selected, zoneAtrFactor)
     int zoneCount = array.size(zones)
-    int count = array.size(result.fixed)
+    int count = array.size(selected)
     // Keep the most recent drawings within Pine's object limits. Calculation is complete.
     int firstDraw = math.max(0, count - 400)
     if count > 0
         for i = firstDraw to count - 1
-            levels.Extreme point = array.get(result.fixed, i)
+            levels.Extreme point = array.get(selected, i)
             color pointColor = point.side == 1 ? color.red : color.teal
-            string name = f_selectedLabel(result.fixed, i)
+            string name = f_selectedLabel(selected, i)
             string tooltip = name + " " + str.tostring(point.price, format.mintick) + "\nPivot bar: " + str.tostring(point.index) + (backward ? "\nSnapshot bar: " : "\nFixed at bar: ") + str.tostring(point.fixedAt) + "\nDelay: " + str.tostring(point.fixedAt - point.index) + " bars"
             array.push(drawnLabels, label.new(point.index, point.price, name, style = point.side == 1 ? label.style_label_down : label.style_label_up, color = pointColor, textcolor = color.white, size = size.tiny, tooltip = tooltip))
             if showSwings and i > firstDraw
-                levels.Extreme previous = array.get(result.fixed, i - 1)
+                levels.Extreme previous = array.get(selected, i - 1)
                 array.push(drawnLines, line.new(previous.index, previous.price, point.index, point.price, color = color.gray))
-    array<int> visibleZones = f_visibleZones(zones, result.fixed, hideIntermediateZones, boundaryExtremeCount, levelCount)
+    array<int> visibleZones = f_visibleZones(zones, selected, hideIntermediateZones, boundaryExtremeCount, levelCount)
     if showLevels and array.size(visibleZones) > 0
         for i in visibleZones
             levels.Zone zone = array.get(zones, i)
@@ -414,7 +448,7 @@ if barstate.islastconfirmedhistory or barstate.islast
         levels.Pivot candidate = result.candidate
         array.push(drawnLabels, label.new(candidate.index, candidate.price, candidate.side == 1 ? "HIGH ?" : "LOW ?", style = candidate.side == 1 ? label.style_label_down : label.style_label_up, color = color.orange, textcolor = color.black, size = size.small, tooltip = backward ? "Unfinished candidate at the oldest end of the backward scan." : "Unfinished candidate. It can move or be replaced."))
         if showSwings and count > 0 and (not backward or firstDraw == 0)
-            levels.Extreme previous = array.get(result.fixed, backward ? 0 : count - 1)
+            levels.Extreme previous = array.get(selected, backward ? 0 : count - 1)
             array.push(drawnLines, line.new(previous.index, previous.price, candidate.index, candidate.price, color = color.orange, style = line.style_dashed))
     if showDebug
         f_row(debug, 0, "PIVOT ZONES v2", extremeMethod + " / " + pivotSource)
@@ -433,3 +467,5 @@ if barstate.islastconfirmedhistory or barstate.islast
         f_row(debug, 12, "Zone extremes", na(latest) ? "—" : str.tostring(latest.members))
         f_row(debug, 13, "Zone start / created bar", na(latest) ? "—" : str.tostring(latest.firstIndex) + " / " + str.tostring(latest.createdAt))
         f_row(debug, 14, "Current bounds known at", na(latest) ? "—" : str.tostring(latest.knownAt))
+
+        f_row(debug, 15, "Extremes before / after filter", str.tostring(array.size(result.fixed)) + " / " + str.tostring(count))

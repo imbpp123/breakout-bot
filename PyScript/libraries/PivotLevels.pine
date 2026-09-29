@@ -116,6 +116,44 @@ export extreme_findBackward(array<Pivot> pivots, int evaluatedAt) =>
     array.reverse(fixed)
     Result.new(fixed, candidate, opposite)
 
+// @function Removes extremes crossed by later closed candle bodies.
+// @param extremes Confirmed extremes, oldest first, inside the supplied candle window.
+// @param bodyLows Lower body prices of consecutive closed candles, oldest first.
+// @param bodyHighs Upper body prices for the same candles. No missing values allowed.
+// @param firstIndex Bar index of the first supplied candle. Include every later closed bar.
+// @returns Independent copies of visible extremes, oldest first. Inputs stay unchanged.
+export extreme_filterCovered(array<Extreme> extremes, array<float> bodyLows, array<float> bodyHighs, int firstIndex) =>
+    int bars = array.size(bodyLows)
+    if bars != array.size(bodyHighs)
+        runtime.error("Body arrays must have equal sizes")
+    array<Extreme> visible = array.new<Extreme>()
+    int cursor = bars - 1
+    float lowest = na
+    float highest = na
+    int count = array.size(extremes)
+    if count > 0
+        for step = 0 to count - 1
+            int i = count - 1 - step
+            Extreme point = array.get(extremes, i)
+            if point.index < firstIndex or point.index >= firstIndex + bars
+                runtime.error("Extreme is outside the closed candle window")
+            if i > 0 and array.get(extremes, i - 1).index > point.index
+                runtime.error("Extremes must be chronological")
+            // Add only candles strictly after this extreme, including pre-confirmation bars.
+            while cursor >= 0 and firstIndex + cursor > point.index
+                float bodyLow = array.get(bodyLows, cursor)
+                float bodyHigh = array.get(bodyHighs, cursor)
+                if na(bodyLow) or na(bodyHigh) or bodyLow > bodyHigh
+                    runtime.error("Invalid candle body")
+                lowest := na(lowest) ? bodyLow : math.min(lowest, bodyLow)
+                highest := na(highest) ? bodyHigh : math.max(highest, bodyHigh)
+                cursor -= 1
+            bool covered = point.side == -1 ? not na(lowest) and lowest < point.price : not na(highest) and highest > point.price
+            if not covered
+                array.push(visible, point.copy())
+    array.reverse(visible)
+    visible
+
 // Zones keep the ATR of their oldest anchor. Merges use the stricter width cap.
 export type Zone
     float bottom
