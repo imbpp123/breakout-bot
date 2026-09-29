@@ -1,0 +1,708 @@
+//@version=6
+// This source code is subject to the Mozilla Public License 2.0: https://mozilla.org/MPL/2.0/
+// H1 channel algorithm adapted from Support Resistance Channels, © LonesomeTheBlue.
+// https://www.tradingview.com/script/Ej53t8Wv-Support-Resistance-Channels/
+strategy("Breakout bot — H1 channels v2", overlay = true, initial_capital = 10000, pyramiding = 0, commission_type = strategy.commission.percent, commission_value = 0.06, slippage = 0, process_orders_on_close = true, calc_on_every_tick = false, calc_on_order_fills = false, max_bars_back = 1000)
+
+// Prototype rules and test steps: docs/pine-prototype.md.
+string trendGroup = "1. Global trend (H1)"
+int supertrendPeriod = input.int(22, "SuperTrend ATR period, H1", minval = 1, maxval = 100, group = trendGroup)
+float supertrendFactor = input.float(3.0, "SuperTrend ATR multiplier", minval = 0.1, step = 0.1, group = trendGroup)
+bool showSupertrend = input.bool(true, "Show confirmed H1 SuperTrend line", group = trendGroup)
+
+string zoneGroup = "2. Price zones"
+int atrPeriod = input.int(14, "ATR period for zones, entry and exits", minval = 1, maxval = 100, group = zoneGroup)
+int m5Span = input.int(3, "M5 pivot bars on each side", minval = 1, maxval = 20, group = zoneGroup)
+string h1Group = "2a. H1 Support Resistance Channels"
+int h1Span = input.int(10, "H1 pivot bars on each side", minval = 4, maxval = 30, group = h1Group)
+string h1Source = input.string("High/Low", "H1 pivot source", options = ["High/Low", "Close/Open"], group = h1Group)
+int h1Lookback = input.int(290, "H1 pivot lookback, bars", minval = 100, maxval = 400, group = h1Group)
+float h1WidthPct = input.float(5, "H1 maximum width, % of 300-bar range", minval = 1, maxval = 8, group = h1Group)
+int h1MinStrength = input.int(2, "H1 minimum strength, units of 20", minval = 1, maxval = 50, group = h1Group)
+int h1MaxChannels = input.int(6, "H1 strongest channels", minval = 1, maxval = 10, group = h1Group)
+bool showH1Channels = input.bool(true, "Show all H1 channels", group = h1Group)
+float zoneWidthAtr = input.float(0.20, "M5 zone half-width, pivot ATR", minval = 0.01, step = 0.05, group = zoneGroup)
+float reactionAtr = input.float(0.50, "Reaction distance, pivot ATR", minval = 0.05, step = 0.05, group = zoneGroup)
+int reactionGap = input.int(3, "Minimum bars between reactions", minval = 1, maxval = 50, group = zoneGroup)
+int zoneLife = input.int(200, "M5 zone lifetime since reaction, bars", minval = 10, maxval = 1000, group = zoneGroup)
+int maxZones = input.int(30, "Maximum M5 zones", minval = 4, maxval = 100, group = zoneGroup)
+float breakAtr = input.float(0.25, "Zone invalidation beyond far edge, pivot ATR", minval = 0.0, step = 0.05, group = zoneGroup)
+float matchAtr = input.float(0.25, "Extra H1/M5 matching tolerance, M5 ATR", minval = 0.0, step = 0.05, group = zoneGroup)
+
+string setupGroup = "3. Setup score (no order book)"
+int minScore = input.int(3, "Required score out of 4", minval = 1, maxval = 4, group = setupGroup)
+int minReactions = input.int(2, "Required completed reactions", minval = 1, maxval = 10, group = setupGroup)
+int roundDigits = input.int(2, "Round price significant digits", minval = 1, maxval = 5, group = setupGroup)
+float roundToleranceAtr = input.float(0.10, "Round price extra tolerance, M5 ATR", minval = 0.0, step = 0.05, group = setupGroup)
+float minPotentialPct = input.float(1.0, "Minimum space to next zone, %", minval = 0.0, step = 0.1, group = setupGroup)
+
+string entryGroup = "4. Entry before zone"
+float entryDistanceAtr = input.float(0.50, "Maximum distance to near edge, M5 ATR", minval = 0.01, step = 0.05, group = entryGroup)
+bool requireApproach = input.bool(true, "Require close to move toward zone", group = entryGroup)
+bool rejectTouch = input.bool(true, "Reject a bar that already touched zone", group = entryGroup)
+int cooldownBars = input.int(12, "Minimum bars after exit", minval = 1, maxval = 1000, group = entryGroup)
+bool oneEntryPerZone = input.bool(true, "Only one entry per zone", group = entryGroup)
+bool allowLong = input.bool(true, "Allow long", group = entryGroup)
+bool allowShort = input.bool(true, "Allow short", group = entryGroup)
+
+string tradeGroup = "5. Test orders and exits"
+bool simulateOrders = input.bool(true, "Simulate orders", group = tradeGroup)
+float allocationPct = input.float(10.0, "Position value, % of equity (not risk)", minval = 0.1, maxval = 100.0, step = 1.0, group = tradeGroup)
+float stopAtr = input.float(1.5, "Initial stop distance, M5 ATR", minval = 0.1, step = 0.1, group = tradeGroup)
+float rewardRisk = input.float(2.0, "Take profit, multiples of stop distance", minval = 0.1, step = 0.1, group = tradeGroup)
+bool useBreakeven = input.bool(false, "Move stop to entry after close confirms move", group = tradeGroup)
+float breakevenPct = input.float(1.0, "Breakeven trigger, price move > %", minval = 0.0, step = 0.1, group = tradeGroup)
+
+string displayGroup = "6. Display and tests"
+bool showDebug = input.bool(true, "Show top-right debug table", group = displayGroup)
+string debugView = input.string("Funnel", "Debug table view", options = ["Funnel", "Current bar"], group = displayGroup)
+bool showZones = input.bool(true, "Show nearest H1/M5 zones", group = displayGroup)
+bool showTrend = input.bool(true, "Show global trend background", group = displayGroup)
+bool runTests = input.bool(true, "Run built-in unit tests on first bar", group = displayGroup)
+
+// TradingView uses negative direction for UP; the strategy uses positive.
+// Ignore the built-in initial direction until ATR and the line are available.
+f_supertrendState(float line, float direction, float atr) =>
+    int state = 0
+    string reason = "History warmup"
+    if not na(line) and not na(direction) and not na(atr)
+        if atr <= 0
+            reason := "No H1 volatility"
+        else if direction == -1
+            state := 1
+            reason := "SuperTrend UP"
+        else if direction == 1
+            state := -1
+            reason := "SuperTrend DOWN"
+        else
+            reason := "Invalid SuperTrend direction"
+    [state, reason]
+
+// Inputs are newest first. This calculation does not read chart data or change inputs.
+type Channel
+    float lower
+    float upper
+    int strength
+    int pivots
+
+f_channelCandidate(array<float> pivots, int seed, float maxWidth) =>
+    float lower = array.get(pivots, seed)
+    float upper = lower
+    int count = 0
+    for price in pivots
+        float width = price <= upper ? upper - price : price - lower
+        if width <= maxWidth
+            lower := math.min(lower, price)
+            upper := math.max(upper, price)
+            count += 1
+    Channel.new(lower, upper, count * 20, count)
+
+f_channelStrength(Channel candidate, array<float> highs, array<float> lows) =>
+    int strength = candidate.pivots * 20
+    if array.size(highs) > 0
+        for i = 0 to array.size(highs) - 1
+            float h = array.get(highs, i)
+            float l = array.get(lows, i)
+            // One bar adds at most one point. A full crossing adds none.
+            if (h >= candidate.lower and h <= candidate.upper) or (l >= candidate.lower and l <= candidate.upper)
+                strength += 1
+    strength
+
+f_buildH1Channels(array<float> pivots, array<float> highs, array<float> lows, float maxWidth, int minStrength, int limit) =>
+    array<Channel> result = array.new<Channel>()
+    array<Channel> candidates = array.new<Channel>()
+    if array.size(pivots) > 0 and not na(maxWidth) and maxWidth >= 0 and limit > 0
+        for i = 0 to array.size(pivots) - 1
+            Channel candidate = f_channelCandidate(pivots, i, maxWidth)
+            candidate.strength := f_channelStrength(candidate, highs, lows)
+            array.push(candidates, candidate)
+        while array.size(result) < limit
+            int best = -1
+            int bestStrength = -1
+            for i = 0 to array.size(candidates) - 1
+                Channel candidate = array.get(candidates, i)
+                if candidate.strength >= minStrength * 20 and candidate.strength > bestStrength
+                    best := i
+                    bestStrength := candidate.strength
+            if best == -1
+                break
+            Channel chosen = array.get(candidates, best)
+            array.push(result, Channel.new(chosen.lower, chosen.upper, chosen.strength, chosen.pivots))
+            // Preserve the author's endpoint suppression rule, including its asymmetry.
+            for candidate in candidates
+                if (candidate.upper >= chosen.lower and candidate.upper <= chosen.upper) or (candidate.lower >= chosen.lower and candidate.lower <= chosen.upper)
+                    candidate.strength := -1
+    result
+
+f_prunePivots(array<float> prices, array<int> indices, int index, int lookback) =>
+    while array.size(indices) > 0
+        if index - array.get(indices, array.size(indices) - 1) <= lookback
+            break
+        array.pop(prices)
+        array.pop(indices)
+    array.size(prices)
+
+f_channelFields(array<Channel> channels, int index) =>
+    Channel channel = index < array.size(channels) ? array.get(channels, index) : na
+    [na(channel) ? na : channel.lower, na(channel) ? na : channel.upper, na(channel) ? 0 : channel.strength, na(channel) ? 0 : channel.pivots]
+
+// Runs in H1 context. Rebuild only when a pivot confirms, as in the source.
+f_globalData(int offset) =>
+    [line, direction] = ta.supertrend(supertrendFactor, supertrendPeriod)
+    float trendAtr = ta.atr(supertrendPeriod)
+    [state, reason] = f_supertrendState(line, direction, trendAtr)
+    float ph = ta.pivothigh(h1Source == "High/Low" ? high : math.max(open, close), h1Span, h1Span)
+    float pl = ta.pivotlow(h1Source == "High/Low" ? low : math.min(open, close), h1Span, h1Span)
+    float maxWidth = (ta.highest(high, 300) - ta.lowest(low, 300)) * h1WidthPct / 100
+    var array<float> pivots = array.new<float>()
+    var array<int> indices = array.new<int>()
+    var array<float> highs = array.new<float>()
+    var array<float> lows = array.new<float>()
+    var array<Channel> channels = array.new<Channel>()
+    array.unshift(highs, high)
+    array.unshift(lows, low)
+    if array.size(highs) > h1Lookback + 1
+        array.pop(highs)
+        array.pop(lows)
+    if not na(ph) or not na(pl)
+        // High takes priority when both confirm, matching the original script.
+        array.unshift(pivots, not na(ph) ? ph : pl)
+        array.unshift(indices, bar_index)
+        f_prunePivots(pivots, indices, bar_index, h1Lookback)
+        channels := f_buildH1Channels(pivots, highs, lows, maxWidth, h1MinStrength, h1MaxChannels)
+    [lo0, hi0, strength0, pivots0] = f_channelFields(channels, 0)
+    [lo1, hi1, strength1, pivots1] = f_channelFields(channels, 1)
+    [lo2, hi2, strength2, pivots2] = f_channelFields(channels, 2)
+    [lo3, hi3, strength3, pivots3] = f_channelFields(channels, 3)
+    [lo4, hi4, strength4, pivots4] = f_channelFields(channels, 4)
+    [lo5, hi5, strength5, pivots5] = f_channelFields(channels, 5)
+    [lo6, hi6, strength6, pivots6] = f_channelFields(channels, 6)
+    [lo7, hi7, strength7, pivots7] = f_channelFields(channels, 7)
+    [lo8, hi8, strength8, pivots8] = f_channelFields(channels, 8)
+    [lo9, hi9, strength9, pivots9] = f_channelFields(channels, 9)
+    // Transfer scalars only; returning growing collections can exhaust request memory.
+    [state[offset], reason[offset], line[offset], trendAtr[offset], time_close[offset], bar_index[offset], lo0[offset], hi0[offset], strength0[offset], pivots0[offset], lo1[offset], hi1[offset], strength1[offset], pivots1[offset], lo2[offset], hi2[offset], strength2[offset], pivots2[offset], lo3[offset], hi3[offset], strength3[offset], pivots3[offset], lo4[offset], hi4[offset], strength4[offset], pivots4[offset], lo5[offset], hi5[offset], strength5[offset], pivots5[offset], lo6[offset], hi6[offset], strength6[offset], pivots6[offset], lo7[offset], hi7[offset], strength7[offset], pivots7[offset], lo8[offset], hi8[offset], strength8[offset], pivots8[offset], lo9[offset], hi9[offset], strength9[offset], pivots9[offset]]
+
+type Zone
+    float center
+    float halfWidth
+    float seedAtr
+    int side
+    int lastReaction
+    int reactions = 0
+    bool pending = true
+    bool used = false
+    int strength = 0
+    int pivots = 0
+
+// H1 channels have no fixed role: price above/below the whole band sets it.
+f_channelSide(float lower, float upper, float price) =>
+    price < lower ? 1 : price > upper ? -1 : 0
+
+f_appendH1Zone(array<Zone> zones, float lower, float upper, int strength, int pivots, int index) =>
+    if not na(lower) and not na(upper)
+        array.push(zones, Zone.new((lower + upper) / 2, (upper - lower) / 2, na, 0, index, 0, false, false, strength, pivots))
+
+f_usedH1Zone(Zone selected, array<Zone> used, int index, int lookback) =>
+    bool found = false
+    if not na(selected)
+        for z in used
+            if index - z.lastReaction <= lookback and math.abs(z.center - selected.center) <= z.halfWidth + selected.halfWidth
+                found := true
+    found
+
+f_matchingReactions(Zone selected, array<Zone> zones, float tolerance) =>
+    int count = 0
+    if not na(selected)
+        for z in zones
+            if z.side == selected.side and math.abs(z.center - selected.center) <= z.halfWidth + selected.halfWidth + tolerance
+                count := math.max(count, z.reactions)
+    count
+
+f_addZone(array<Zone> zones, float price, float atr, int side, int index, float width, float tick, int limit) =>
+    if not na(price) and not na(atr) and atr > 0
+        bool found = false
+        for z in zones
+            if z.side == side and math.abs(z.center - price) <= z.halfWidth
+                found := true
+        if not found
+            if array.size(zones) >= limit
+                array.shift(zones)
+            array.push(zones, Zone.new(price, math.max(atr * width, tick), atr, side, index))
+
+f_updateZones(array<Zone> zones, float h, float l, float c, int index, int lifetime, int gap, float retreat, float invalidation) =>
+    int i = array.size(zones) - 1
+    while i >= 0
+        Zone z = array.get(zones, i)
+        float lower = z.center - z.halfWidth
+        float upper = z.center + z.halfWidth
+        bool broken = z.side == 1 ? c > upper + invalidation * z.seedAtr : c < lower - invalidation * z.seedAtr
+        if broken or index - z.lastReaction > lifetime
+            array.remove(zones, i)
+        else
+            bool touched = h >= lower and l <= upper
+            if touched and (z.reactions == 0 or index - z.lastReaction >= gap)
+                z.pending := true
+            bool departed = z.side == 1 ? c <= lower - retreat * z.seedAtr : c >= upper + retreat * z.seedAtr
+            if z.pending and departed
+                z.reactions += 1
+                z.lastReaction := index
+                z.pending := false
+        i -= 1
+
+f_nearest(array<Zone> zones, float price, int side) =>
+    Zone best = na
+    float distance = na
+    for z in zones
+        float edge = z.center - side * z.halfWidth
+        float candidateDistance = side * (edge - price)
+        if z.side == side and candidateDistance > 0 and (na(distance) or candidateDistance < distance)
+            distance := candidateDistance
+            best := z
+    best
+
+f_match(Zone selected, array<Zone> zones, float tolerance) =>
+    bool matched = false
+    if not na(selected)
+        for z in zones
+            if z.side == selected.side and math.abs(z.center - selected.center) <= z.halfWidth + selected.halfWidth + tolerance
+                matched := true
+    matched
+
+f_target(Zone selected, array<Zone> zones, float current) =>
+    float result = current
+    for z in zones
+        float edge = z.center - selected.side * z.halfWidth
+        float selectedFarEdge = selected.center + selected.side * selected.halfWidth
+        if z.side == selected.side and selected.side * (edge - selectedFarEdge) > 0
+            if na(result) or selected.side * (edge - result) < 0
+                result := edge
+    result
+
+f_roundPrice(float price, int digits, float tick) =>
+    float step = math.max(tick, math.pow(10, math.floor(math.log10(price)) - digits + 1))
+    math.round(price / step) * step
+
+f_entryChecks(int side, float nearEdge, float c, float previous, float h, float l, float maxDistance, bool approach, bool noTouch) =>
+    float distance = side * (nearEdge - c)
+    bool moving = not approach or side * (c - previous) > 0
+    bool untouched = not noTouch or (side == 1 ? h < nearEdge : l > nearEdge)
+    [distance > 0 and distance <= maxDistance, moving, untouched]
+
+f_entryReady(int side, float nearEdge, float c, float previous, float h, float l, float maxDistance, bool approach, bool noTouch) =>
+    [near, moving, untouched] = f_entryChecks(side, nearEdge, c, previous, h, l, maxDistance, approach, noTouch)
+    near and moving and untouched
+
+// Result is the first failed gate, or the number of gates when all passed.
+f_firstFailed(array<bool> checks) =>
+    int passed = 0
+    for check in checks
+        if not check
+            break
+        passed += 1
+    passed
+
+f_countPasses(array<int> counts, int passed) =>
+    for i = 0 to passed
+        array.set(counts, i, array.get(counts, i) + 1)
+
+f_blockReason(int gate) =>
+    switch gate
+        0 => "History warmup"
+        1 => "No directional H1 trend"
+        2 => "Direction disabled"
+        3 => "No strong H1 channel ahead"
+        4 => "Setup score too low"
+        5 => "Outside entry distance"
+        6 => "Close is not moving toward zone"
+        7 => "Signal bar already touched zone"
+        8 => "Position open"
+        9 => "Cooldown after exit / signal"
+        10 => "Zone already traded"
+        11 => "Invalid order size / protection"
+        => "All entry checks passed"
+
+f_score(bool roundLevel, bool reactions, bool matching, bool potential) =>
+    (roundLevel ? 1 : 0) + (reactions ? 1 : 0) + (matching ? 1 : 0) + (potential ? 1 : 0)
+
+f_assert(bool condition, string message) =>
+    if not condition
+        runtime.error("Unit test failed: " + message)
+
+// Tests call the same calculation functions as live bars, without market data.
+f_unitTests() =>
+    array<float> empty = array.new<float>()
+    f_assert(array.size(f_buildH1Channels(empty, empty, empty, 2, 1, 6)) == 0, "Empty pivots give no channels")
+    f_assert(array.size(f_buildH1Channels(array.from(100.0), empty, empty, na, 1, 6)) == 0, "Missing width gives no channels")
+    f_assert(array.size(f_buildH1Channels(array.from(100.0), empty, empty, -1, 1, 6)) == 0, "Negative width gives no channels")
+    f_assert(array.size(f_buildH1Channels(array.from(100.0), empty, empty, 2, 1, 0)) == 0, "Zero limit gives no channels")
+    array<float> pivotSample = array.from(100.0, 102.0, 104.0)
+    Channel bounded = f_channelCandidate(pivotSample, 0, 2)
+    f_assert(bounded.lower == 100 and bounded.upper == 102 and bounded.pivots == 2, "Total width blocks chained expansion")
+    f_assert(array.get(pivotSample, 2) == 104 and array.size(pivotSample) == 3, "Builder preserves input pivots")
+    Channel hits = Channel.new(100, 102, 0, 2)
+    f_assert(f_channelStrength(hits, array.from(102.0, 103.0, 101.0, 99.0), array.from(100.0, 99.0, 98.0, 97.0)) == 42, "Boundary hits count once; full crossing adds zero")
+    array<Channel> ranked = f_buildH1Channels(array.from(100.0, 101.0, 110.0, 111.0), array.from(110.5), array.from(109.0), 1, 2, 6)
+    f_assert(array.size(ranked) == 2, "Duplicate overlapping candidates are suppressed")
+    f_assert(array.get(ranked, 0).lower == 110 and array.get(ranked, 0).upper == 111 and array.get(ranked, 0).strength == 41, "Strongest channel comes first")
+    f_assert(array.get(ranked, 1).lower == 100 and array.get(ranked, 1).strength == 40, "Minimum strength equality passes")
+    f_assert(array.size(f_buildH1Channels(array.from(100.0, 101.0, 110.0, 111.0), empty, empty, 1, 2, 1)) == 1, "Channel limit is applied")
+    f_assert(array.size(f_buildH1Channels(array.from(100.0), empty, empty, 1, 2, 6)) == 0, "Weak candidate is rejected")
+    array<Channel> repeated = f_buildH1Channels(array.from(100.0, 100.0), empty, empty, 0, 2, 6)
+    f_assert(array.size(repeated) == 1 and array.get(repeated, 0).lower == 100 and array.get(repeated, 0).upper == 100, "Equal pivots form a zero-width level")
+    array<float> expiring = array.from(110.0, 100.0, 90.0)
+    array<int> confirmedAt = array.from(20, 10, 9)
+    f_prunePivots(expiring, confirmedAt, 20, 10)
+    f_assert(array.size(expiring) == 2 and array.get(expiring, 1) == 100, "Pivot at lookback boundary remains")
+    f_prunePivots(expiring, confirmedAt, 31, 10)
+    f_assert(array.size(expiring) == 0 and array.size(confirmedAt) == 0, "Expired pivots and timestamps leave together")
+    f_assert(f_channelSide(100, 102, 99) == 1 and f_channelSide(100, 102, 103) == -1, "Channel changes role after price crosses")
+    f_assert(f_channelSide(100, 102, 100) == 0 and f_channelSide(100, 102, 102) == 0, "Channel boundaries are inside")
+    array<Zone> used = array.from(Zone.new(101, 1, na, 1, 10))
+    Zone rebuilt = Zone.new(102, 1, na, -1, 11)
+    f_assert(f_usedH1Zone(rebuilt, used, 20, 10), "Rebuild and role change do not reset used zone")
+    f_assert(not f_usedH1Zone(rebuilt, used, 21, 10), "Used-zone record expires after lookback")
+    f_assert(not f_usedH1Zone(Zone.new(110, 1, na, 1, 11), used, 11, 10), "Distinct channel is not blocked")
+    f_assert(not f_usedH1Zone(na, used, 11, 10), "Missing selected channel cannot match used zone")
+    array<Zone> localZones = array.from(Zone.new(101, 1, 1, 1, 0, 2), Zone.new(102, 1, 1, 1, 0, 3), Zone.new(101, 1, 1, -1, 0, 9))
+    f_assert(f_matchingReactions(Zone.new(101, 1, na, 1, 0), localZones, 0) == 3, "Use maximum matching reactions, not sum or opposite side")
+    f_assert(f_matchingReactions(Zone.new(110, 1, na, 1, 0), localZones, 0) == 0, "Distant M5 reactions do not qualify")
+    array<Zone> missingH1 = array.new<Zone>()
+    f_assert(na(f_nearest(missingH1, 99, 1)), "M5 zones cannot replace missing H1 channels")
+
+    f_assert(f_firstFailed(array.from(true, true, true)) == 3, "All gates passed")
+    f_assert(f_firstFailed(array.from(false, true, true)) == 0, "Warmup blocks later checks")
+    f_assert(f_firstFailed(array.from(true, false, false)) == 1, "First failed gate wins")
+    array<int> counts = array.new<int>(4, 0)
+    f_countPasses(counts, 1)
+    f_countPasses(counts, 3)
+    f_assert(array.get(counts, 0) == 2 and array.get(counts, 1) == 2 and array.get(counts, 2) == 1 and array.get(counts, 3) == 1, "Funnel counts passed prefixes only")
+    f_assert(f_blockReason(7) == "Signal bar already touched zone", "Touch failure is explicit")
+    [nearCheck, movingCheck, touchedCheck] = f_entryChecks(1, 100, 99, 98, 100, 97, 1, true, true)
+    f_assert(nearCheck and movingCheck and not touchedCheck, "Touch blocks an otherwise valid approach")
+    [relaxedNear, relaxedMoving, relaxedTouch] = f_entryChecks(1, 100, 99, 100, 100, 97, 1, false, false)
+    f_assert(relaxedNear and relaxedMoving and relaxedTouch, "Disabled approach and touch checks pass")
+    [up, upReason] = f_supertrendState(95, -1, 2)
+    f_assert(up == 1 and upReason == "SuperTrend UP", "Native negative direction allows long")
+    [down, downReason] = f_supertrendState(105, 1, 2)
+    f_assert(down == -1 and downReason == "SuperTrend DOWN", "Native positive direction allows short")
+    [missingLine, lineReason] = f_supertrendState(na, 1, 2)
+    f_assert(missingLine == 0 and lineReason == "History warmup", "Initial direction cannot trade without line")
+    [missingAtr, atrReason] = f_supertrendState(105, 1, na)
+    f_assert(missingAtr == 0 and atrReason == "History warmup", "Missing ATR blocks trend")
+    [missingDirection, directionReason] = f_supertrendState(105, na, 2)
+    f_assert(missingDirection == 0, "Missing direction blocks trend")
+    [zeroAtr, zeroReason] = f_supertrendState(100, -1, 0)
+    f_assert(zeroAtr == 0 and zeroReason == "No H1 volatility", "Zero ATR blocks trend")
+    [invalidDirection, invalidReason] = f_supertrendState(100, 0, 2)
+    f_assert(invalidDirection == 0 and invalidReason == "Invalid SuperTrend direction", "Invalid direction blocks trend")
+
+    array<Zone> zones = array.new<Zone>()
+    f_addZone(zones, 100, 2, 1, 0, 0.5, 0.01, 3)
+    f_updateZones(zones, 100, 97, 98, 0, 10, 3, 0.5, 0.25)
+    Zone resistance = array.get(zones, 0)
+    f_assert(resistance.reactions == 1, "Seed reaction requires departure")
+    f_updateZones(zones, 100, 97, 98, 1, 10, 3, 0.5, 0.25)
+    f_assert(resistance.reactions == 1, "Adjacent bars are not independent reactions")
+    f_updateZones(zones, 100, 99, 100, 3, 10, 3, 0.5, 0.25)
+    f_assert(resistance.reactions == 1, "Touch is not a completed reaction")
+    f_updateZones(zones, 99, 97, 98, 4, 10, 3, 0.5, 0.25)
+    f_assert(resistance.reactions == 2, "Second completed reaction")
+    f_addZone(zones, 100.5, 2, 1, 5, 0.5, 0.01, 3)
+    f_assert(array.size(zones) == 1 and resistance.reactions == 2, "Merged pivot does not add reaction")
+    f_assert(not na(f_nearest(zones, 98, 1)) and na(f_nearest(zones, 99, 1)), "Near edge must be ahead of price")
+    f_assert(na(f_target(resistance, zones, na)), "Missing target stays missing")
+    f_addZone(zones, 110, 2, 1, 5, 0.5, 0.01, 3)
+    f_assert(f_target(resistance, zones, na) == 109, "Target uses next near edge")
+    f_assert(f_match(resistance, zones, 0), "Overlapping zones match")
+    f_updateZones(zones, 103, 100, 102, 6, 10, 3, 0.5, 0.25)
+    f_assert(array.size(zones) == 1, "Broken resistance is removed")
+    f_updateZones(zones, 105, 103, 104, 20, 10, 3, 0.5, 0.25)
+    f_assert(array.size(zones) == 0, "Old zone expires")
+    array<Zone> supports = array.new<Zone>()
+    f_addZone(supports, 100, 2, -1, 0, 0.5, 0.01, 2)
+    f_updateZones(supports, 103, 100, 102, 0, 10, 3, 0.5, 0.25)
+    Zone support = array.get(supports, 0)
+    f_assert(support.reactions == 1, "Support reaction is symmetric")
+    f_assert(not f_match(support, zones, 0), "Empty H1 zones do not match")
+    f_addZone(supports, 90, 2, -1, 1, 0.5, 0.01, 2)
+    f_assert(f_target(support, supports, na) == 91, "Short target uses upper edge")
+    f_addZone(supports, 80, 2, -1, 2, 0.5, 0.01, 2)
+    f_assert(array.size(supports) == 2 and array.get(supports, 0).center == 90, "Zone count is bounded")
+
+    f_assert(f_entryReady(1, 100, 99, 98, 99.5, 97, 1, true, true), "Long at distance boundary")
+    f_assert(f_entryReady(-1, 100, 101, 102, 103, 100.5, 1, true, true), "Short at distance boundary")
+    f_assert(not f_entryReady(1, 100, 99, 98, 100, 97, 1, true, true), "Touched zone rejects entry")
+    f_assert(not f_entryReady(1, 100, 100, 99, 100, 98, 1, true, false), "At level is not before level")
+    f_assert(not f_entryReady(1, 100, 101, 99, 101, 98, 1, true, false), "Past level rejects entry")
+    f_assert(not f_entryReady(1, 100, 98, 97, 99, 96, 1, true, true), "Distant price rejects entry")
+    f_assert(not f_entryReady(1, 100, 99, 99.5, 99.5, 98, 1, true, true), "Moving away rejects entry")
+    f_assert(f_score(true, true, false, true) == 3 and f_score(false, false, false, false) == 0, "Four independent criteria")
+    f_assert(math.abs(f_roundPrice(0.0087564, 2, 0.0000001) - 0.0088) < 0.00000001, "Small round prices")
+    true
+
+bool isM5 = timeframe.in_seconds() == 300
+if barstate.isfirst
+    if (not isM5 and timeframe.in_seconds() != 3600) or not chart.is_standard
+        runtime.error("Use standard M5 candles for trades or H1 candles to inspect channels.")
+    if runTests
+        f_unitTests()
+
+[globalTrend, trendReason, h1Supertrend, h1TrendAtr, h1ClosedAt, h1Index, h1Lower0, h1Upper0, h1Strength0, h1Pivots0, h1Lower1, h1Upper1, h1Strength1, h1Pivots1, h1Lower2, h1Upper2, h1Strength2, h1Pivots2, h1Lower3, h1Upper3, h1Strength3, h1Pivots3, h1Lower4, h1Upper4, h1Strength4, h1Pivots4, h1Lower5, h1Upper5, h1Strength5, h1Pivots5, h1Lower6, h1Upper6, h1Strength6, h1Pivots6, h1Lower7, h1Upper7, h1Strength7, h1Pivots7, h1Lower8, h1Upper8, h1Strength8, h1Pivots8, h1Lower9, h1Upper9, h1Strength9, h1Pivots9] = if isM5
+    request.security(syminfo.tickerid, "60", f_globalData(1), lookahead = barmerge.lookahead_on)
+else
+    f_globalData(0)
+
+float m5Atr = ta.atr(atrPeriod)
+float m5PivotHigh = ta.pivothigh(high, m5Span, m5Span)
+float m5PivotLow = ta.pivotlow(low, m5Span, m5Span)
+var array<Zone> m5Zones = array.new<Zone>()
+var array<Zone> h1Zones = array.new<Zone>()
+var array<Zone> usedH1Zones = array.new<Zone>()
+bool newH1 = not na(h1ClosedAt) and (na(h1ClosedAt[1]) or h1ClosedAt != h1ClosedAt[1])
+
+if barstate.isconfirmed
+    if newH1
+        array.clear(h1Zones)
+        f_appendH1Zone(h1Zones, h1Lower0, h1Upper0, h1Strength0, h1Pivots0, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower1, h1Upper1, h1Strength1, h1Pivots1, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower2, h1Upper2, h1Strength2, h1Pivots2, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower3, h1Upper3, h1Strength3, h1Pivots3, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower4, h1Upper4, h1Strength4, h1Pivots4, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower5, h1Upper5, h1Strength5, h1Pivots5, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower6, h1Upper6, h1Strength6, h1Pivots6, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower7, h1Upper7, h1Strength7, h1Pivots7, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower8, h1Upper8, h1Strength8, h1Pivots8, h1Index)
+        f_appendH1Zone(h1Zones, h1Lower9, h1Upper9, h1Strength9, h1Pivots9, h1Index)
+        int usedIndex = array.size(usedH1Zones) - 1
+        while usedIndex >= 0
+            if h1Index - array.get(usedH1Zones, usedIndex).lastReaction > h1Lookback
+                array.remove(usedH1Zones, usedIndex)
+            usedIndex -= 1
+    if isM5
+        f_addZone(m5Zones, m5PivotHigh, m5Atr[m5Span], 1, bar_index, zoneWidthAtr, syminfo.mintick, maxZones)
+        f_addZone(m5Zones, m5PivotLow, m5Atr[m5Span], -1, bar_index, zoneWidthAtr, syminfo.mintick, maxZones)
+        f_updateZones(m5Zones, high, low, close, bar_index, zoneLife, reactionGap, reactionAtr, breakAtr)
+    for z in h1Zones
+        z.side := f_channelSide(z.center - z.halfWidth, z.center + z.halfWidth, close)
+
+Zone m5Resistance = f_nearest(m5Zones, close, 1)
+Zone m5Support = f_nearest(m5Zones, close, -1)
+Zone h1Resistance = f_nearest(h1Zones, close, 1)
+Zone h1Support = f_nearest(h1Zones, close, -1)
+int side = globalTrend == 1 ? 1 : globalTrend == -1 ? -1 : 0
+Zone selected = side == 1 ? h1Resistance : side == -1 ? h1Support : na
+int matchedReactions = f_matchingReactions(selected, m5Zones, matchAtr * m5Atr)
+float nearEdge = na
+float target = na
+float potentialPct = na
+float roundedPrice = na
+bool roundPass = false
+bool reactionsPass = false
+bool matchPass = false
+bool potentialPass = false
+bool entryReady = false
+bool distancePass = false
+bool approachPass = false
+bool touchPass = false
+
+if not na(selected) and not na(m5Atr)
+    nearEdge := selected.center - side * selected.halfWidth
+    roundedPrice := f_roundPrice(selected.center, roundDigits, syminfo.mintick)
+    roundPass := math.abs(selected.center - roundedPrice) <= selected.halfWidth + roundToleranceAtr * m5Atr
+    reactionsPass := matchedReactions >= minReactions
+    matchPass := f_match(selected, m5Zones, matchAtr * m5Atr)
+    target := f_target(selected, m5Zones, na)
+    target := f_target(selected, h1Zones, target)
+    potentialPct := not na(target) ? side * (target - close) / close * 100 : na
+    potentialPass := not na(potentialPct) and potentialPct >= minPotentialPct
+    [near, moving, untouched] = f_entryChecks(side, nearEdge, close, close[1], high, low, entryDistanceAtr * m5Atr, requireApproach, rejectTouch)
+    distancePass := near
+    approachPass := moving
+    touchPass := untouched
+    entryReady := near and moving and untouched
+
+int score = f_score(roundPass, reactionsPass, matchPass, potentialPass)
+bool setup = isM5 and side != 0 and not na(selected) and score >= minScore
+var int lastExitBar = na
+var int lastSignalBar = na
+var float tradeStop = na
+var float tradeTarget = na
+if strategy.closedtrades > nz(strategy.closedtrades[1])
+    lastExitBar := bar_index
+if strategy.position_size == 0
+    tradeStop := na
+    tradeTarget := na
+
+bool coolingDown = (not na(lastExitBar) and bar_index - lastExitBar < cooldownBars) or (not simulateOrders and not na(lastSignalBar) and bar_index - lastSignalBar < cooldownBars)
+bool directionAllowed = side == 1 ? allowLong : side == -1 ? allowShort : false
+bool zoneUsed = oneEntryPerZone and f_usedH1Zone(selected, usedH1Zones, h1Index, h1Lookback)
+float stopDistance = math.max(nz(m5Atr) * stopAtr, syminfo.mintick)
+float proposedStop = math.round_to_mintick(close - side * stopDistance)
+float proposedTarget = math.round_to_mintick(close + side * stopDistance * rewardRisk)
+bool validProtection = side != 0 and proposedStop > 0 and proposedTarget > 0 and side * (close - proposedStop) > 0 and side * (proposedTarget - close) > 0
+float quantity = strategy.equity > 0 ? strategy.equity * allocationPct / 100 / (close * syminfo.pointvalue) : 0
+bool dataReady = not na(globalTrend) and trendReason != "History warmup" and not na(m5Atr)
+int blockedGate = f_firstFailed(array.from(dataReady, side != 0, directionAllowed, not na(selected), score >= minScore, distancePass, approachPass, touchPass, strategy.position_size == 0, not coolingDown, not zoneUsed, not simulateOrders or (validProtection and quantity > 0)))
+bool signal = isM5 and barstate.isconfirmed and blockedGate == 12
+var array<int> passedBars = array.new<int>(13, 0)
+var int ordersSent = 0
+var int firstCountedTime = na
+if isM5 and barstate.isconfirmed
+    f_countPasses(passedBars, blockedGate)
+    if na(firstCountedTime)
+        firstCountedTime := time
+
+if signal
+    array.push(usedH1Zones, Zone.new(selected.center, selected.halfWidth, na, side, h1Index))
+    lastSignalBar := bar_index
+    if simulateOrders
+        ordersSent += 1
+        tradeStop := proposedStop
+        tradeTarget := proposedTarget
+        if side == 1
+            strategy.entry("Long", strategy.long, qty = quantity)
+            strategy.exit("Long exit", "Long", stop = tradeStop, limit = tradeTarget)
+        else
+            strategy.entry("Short", strategy.short, qty = quantity)
+            strategy.exit("Short exit", "Short", stop = tradeStop, limit = tradeTarget)
+
+if strategy.position_size != 0
+    int tradeSide = strategy.position_size > 0 ? 1 : -1
+    float movePct = tradeSide * (close - strategy.position_avg_price) / strategy.position_avg_price * 100
+    if useBreakeven and movePct > breakevenPct
+        tradeStop := tradeSide == 1 ? math.max(tradeStop, strategy.position_avg_price) : math.min(tradeStop, strategy.position_avg_price)
+    if tradeSide == 1
+        strategy.exit("Long exit", "Long", stop = tradeStop, limit = tradeTarget)
+    else
+        strategy.exit("Short exit", "Short", stop = tradeStop, limit = tradeTarget)
+
+string status = f_blockReason(blockedGate)
+if signal
+    status := simulateOrders ? "Entry signal / order sent" : "Entry signal (orders disabled)"
+
+color trendColor = side == 1 ? color.green : side == -1 ? color.red : color.gray
+plot(showSupertrend and globalTrend == 1 ? h1Supertrend : na, "H1 SuperTrend UP", color.lime, 2, plot.style_linebr)
+plot(showSupertrend and globalTrend == -1 ? h1Supertrend : na, "H1 SuperTrend DOWN", color.red, 2, plot.style_linebr)
+bgcolor(showTrend ? color.new(trendColor, 94) : na, title = "Confirmed H1 trend")
+resLow = plot(showZones and not na(m5Resistance) ? m5Resistance.center - m5Resistance.halfWidth : na, "M5 resistance lower", color.new(color.red, 25), style = plot.style_linebr)
+resHigh = plot(showZones and not na(m5Resistance) ? m5Resistance.center + m5Resistance.halfWidth : na, "M5 resistance upper", color.new(color.red, 25), style = plot.style_linebr)
+fill(resLow, resHigh, color.new(color.red, 90))
+supLow = plot(showZones and not na(m5Support) ? m5Support.center - m5Support.halfWidth : na, "M5 support lower", color.new(color.teal, 25), style = plot.style_linebr)
+supHigh = plot(showZones and not na(m5Support) ? m5Support.center + m5Support.halfWidth : na, "M5 support upper", color.new(color.teal, 25), style = plot.style_linebr)
+fill(supLow, supHigh, color.new(color.teal, 90))
+h1Bottom0 = plot(showH1Channels ? h1Lower0 : na, "H1 channel 1 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top0 = plot(showH1Channels ? h1Upper0 : na, "H1 channel 1 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom0, h1Top0, color.new(color.blue, 90))
+h1Bottom1 = plot(showH1Channels ? h1Lower1 : na, "H1 channel 2 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top1 = plot(showH1Channels ? h1Upper1 : na, "H1 channel 2 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom1, h1Top1, color.new(color.blue, 90))
+h1Bottom2 = plot(showH1Channels ? h1Lower2 : na, "H1 channel 3 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top2 = plot(showH1Channels ? h1Upper2 : na, "H1 channel 3 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom2, h1Top2, color.new(color.blue, 90))
+h1Bottom3 = plot(showH1Channels ? h1Lower3 : na, "H1 channel 4 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top3 = plot(showH1Channels ? h1Upper3 : na, "H1 channel 4 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom3, h1Top3, color.new(color.blue, 90))
+h1Bottom4 = plot(showH1Channels ? h1Lower4 : na, "H1 channel 5 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top4 = plot(showH1Channels ? h1Upper4 : na, "H1 channel 5 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom4, h1Top4, color.new(color.blue, 90))
+h1Bottom5 = plot(showH1Channels ? h1Lower5 : na, "H1 channel 6 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top5 = plot(showH1Channels ? h1Upper5 : na, "H1 channel 6 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom5, h1Top5, color.new(color.blue, 90))
+h1Bottom6 = plot(showH1Channels ? h1Lower6 : na, "H1 channel 7 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top6 = plot(showH1Channels ? h1Upper6 : na, "H1 channel 7 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom6, h1Top6, color.new(color.blue, 90))
+h1Bottom7 = plot(showH1Channels ? h1Lower7 : na, "H1 channel 8 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top7 = plot(showH1Channels ? h1Upper7 : na, "H1 channel 8 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom7, h1Top7, color.new(color.blue, 90))
+h1Bottom8 = plot(showH1Channels ? h1Lower8 : na, "H1 channel 9 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top8 = plot(showH1Channels ? h1Upper8 : na, "H1 channel 9 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom8, h1Top8, color.new(color.blue, 90))
+h1Bottom9 = plot(showH1Channels ? h1Lower9 : na, "H1 channel 10 lower", color.new(color.blue, 45), style = plot.style_stepline)
+h1Top9 = plot(showH1Channels ? h1Upper9 : na, "H1 channel 10 upper", color.new(color.blue, 45), style = plot.style_stepline)
+fill(h1Bottom9, h1Top9, color.new(color.blue, 90))
+plot(showZones and not na(h1Resistance) ? h1Resistance.center : na, "H1 resistance center", color.orange, 2, plot.style_circles)
+plot(showZones and not na(h1Support) ? h1Support.center : na, "H1 support center", color.blue, 2, plot.style_circles)
+plot(isM5 and not na(selected) ? nearEdge - side * entryDistanceAtr * m5Atr : na, "Entry band outer edge", color.yellow, style = plot.style_linebr)
+plot(isM5 ? target : na, "Next zone target (score only)", color.purple, style = plot.style_circles)
+plot(tradeStop, "Test stop", color.red, 2, plot.style_linebr)
+plot(tradeTarget, "Test take profit", color.lime, 2, plot.style_linebr)
+plotshape(setup and not setup[1], title = "Setup found", style = shape.diamond, location = location.bottom, color = color.yellow, size = size.tiny, text = "SET")
+plotshape(signal and side == 1, title = "Long signal", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.small, text = "LONG")
+plotshape(signal and side == -1, title = "Short signal", style = shape.triangledown, location = location.abovebar, color = color.red, size = size.small, text = "SHORT")
+plot(globalTrend, "Debug: H1 SuperTrend (1 up, -1 down, 0 unavailable)", display = display.data_window)
+plot(h1Supertrend, "Debug: confirmed H1 SuperTrend line", display = display.data_window)
+plot(h1TrendAtr, "Debug: SuperTrend ATR H1", display = display.data_window)
+plot(score, "Debug: setup score", display = display.data_window)
+plot(not na(selected) ? matchedReactions : na, "Debug: completed reactions", display = display.data_window)
+plot(blockedGate, "Debug: first block (0 warmup,1 trend,2 side,3 zone,4 score,5 distance,6 approach,7 touch,8 position,9 pause,10 used,11 order,12 PASS)", display = display.data_window)
+plot(na(selected) ? na : (roundPass ? 1 : 0), "Debug: round price", display = display.data_window)
+plot(na(selected) ? na : (matchPass ? 1 : 0), "Debug: M5 zone match", display = display.data_window)
+plot(potentialPct, "Debug: potential %", display = display.data_window)
+plot(nearEdge, "Debug: selected near edge", display = display.data_window)
+plot(na(selected) ? na : (distancePass ? 1 : 0), "Debug: entry distance pass", display = display.data_window)
+plot(na(selected) ? na : (approachPass ? 1 : 0), "Debug: approach pass", display = display.data_window)
+plot(na(selected) ? na : (touchPass ? 1 : 0), "Debug: untouched pass", display = display.data_window)
+
+f_price(float value) =>
+    na(value) ? "—" : str.tostring(value, format.mintick)
+
+f_check(bool passed) =>
+    passed ? "PASS" : "FAIL"
+
+f_row(table panel, int row, string title, string value, color valueColor = color.white) =>
+    table.cell(panel, 0, row, title, text_color = color.silver, text_halign = text.align_left, text_size = size.small)
+    table.cell(panel, 1, row, value, text_color = valueColor, text_halign = text.align_left, text_size = size.small)
+
+var table debug = table.new(position.top_right, 2, 21, bgcolor = color.new(color.black, 10), border_width = 1, border_color = color.new(color.gray, 60))
+if (barstate.islastconfirmedhistory or barstate.islast) and showDebug and isM5 and debugView == "Current bar"
+    string trendName = globalTrend == 1 ? "UP" : globalTrend == -1 ? "DOWN" : "UNAVAILABLE"
+    f_row(debug, 0, "H1 CHANNELS v2", syminfo.ticker + " / M5")
+    f_row(debug, 1, "Global H1 trend", trendName, trendColor)
+    f_row(debug, 2, "Trend reason", trendReason)
+    f_row(debug, 3, "H1 SuperTrend / ATR", f_price(h1Supertrend) + " / " + f_price(h1TrendAtr))
+    f_row(debug, 4, "Last H1 close (UTC)", na(h1ClosedAt) ? "—" : str.format_time(h1ClosedAt, "yyyy-MM-dd HH:mm", "UTC"))
+    f_row(debug, 5, "ATR M5 / active zones M5-H1", f_price(m5Atr) + " / " + str.tostring(array.size(m5Zones)) + "-" + str.tostring(array.size(h1Zones)))
+    f_row(debug, 6, "Selected H1 channel", na(selected) ? "—" : f_price(selected.center - selected.halfWidth) + " … " + f_price(selected.center + selected.halfWidth))
+    f_row(debug, 7, "Round price", na(selected) ? "N/A: no selected zone" : f_check(roundPass) + " / " + f_price(roundedPrice))
+    f_row(debug, 8, "Completed reactions", na(selected) ? "N/A" : f_check(reactionsPass) + " / " + str.tostring(matchedReactions))
+    f_row(debug, 9, "Same zone on M5", na(selected) ? "N/A" : f_check(matchPass))
+    f_row(debug, 10, "Space to next zone", na(selected) ? "N/A" : f_check(potentialPass) + " / " + (na(potentialPct) ? "—" : str.tostring(potentialPct, "#.##") + "%"))
+    f_row(debug, 11, "Next zone target", f_price(target))
+    f_row(debug, 12, "Setup score", str.tostring(score) + " / 4; need " + str.tostring(minScore), setup ? color.lime : color.orange)
+    f_row(debug, 13, "Distance to zone / max", f_price(not na(selected) ? side * (nearEdge - close) : na) + " / " + f_price(entryDistanceAtr * m5Atr))
+    f_row(debug, 14, "Entry condition", f_check(entryReady))
+    f_row(debug, 15, "Status", status, signal ? color.lime : color.orange)
+    f_row(debug, 16, "Position / orders", (strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT") + (simulateOrders ? " / ON" : " / OFF"))
+    f_row(debug, 17, "Stop / take profit", f_price(tradeStop) + " / " + f_price(tradeTarget))
+    f_row(debug, 18, "H1 strength / pivots", na(selected) ? "—" : str.tostring(selected.strength) + " / " + str.tostring(selected.pivots))
+    f_row(debug, 19, "Distance / approach / no touch", na(selected) ? "N/A" : f_check(distancePass) + " / " + f_check(approachPass) + " / " + f_check(touchPass))
+    f_row(debug, 20, "Signals / orders sent / fills", str.tostring(array.get(passedBars, 12)) + " / " + str.tostring(ordersSent) + " / " + str.tostring(strategy.closedtrades + strategy.opentrades))
+
+if (barstate.islastconfirmedhistory or barstate.islast) and showDebug and isM5 and debugView == "Funnel"
+    f_row(debug, 0, "DEBUG FUNNEL / M5 BARS", "Passed / lost at this step")
+    f_row(debug, 1, "Current H1", (globalTrend == 1 ? "UP" : globalTrend == -1 ? "DOWN" : "UNAVAILABLE") + " / " + trendReason)
+    f_row(debug, 2, "Current block", str.tostring(blockedGate) + ": " + status, color.orange)
+    f_row(debug, 3, "History starts (UTC)", na(firstCountedTime) ? "—" : str.format_time(firstCountedTime, "yyyy-MM-dd HH:mm", "UTC"))
+    array<string> steps = array.from("All closed M5 bars", "Data ready", "Directional H1", "Direction enabled", "Strong H1 channel ahead", "Setup score passed", "Within entry distance", "Moving toward zone", "Bar has not touched zone", "No open position", "Cooldown passed", "Zone not used", "Order valid / ENTRY SIGNAL")
+    for i = 0 to 12
+        int passed = array.get(passedBars, i)
+        int lost = i == 0 ? 0 : array.get(passedBars, i - 1) - passed
+        f_row(debug, i + 4, array.get(steps, i), str.tostring(passed) + " / " + str.tostring(lost), lost > 0 ? color.orange : color.white)
+    f_row(debug, 17, "Orders sent / entries filled", str.tostring(ordersSent) + " / " + str.tostring(strategy.closedtrades + strategy.opentrades))
+    f_row(debug, 18, "Closed trades / open trades", str.tostring(strategy.closedtrades) + " / " + str.tostring(strategy.opentrades))
+    f_row(debug, 19, "Unit tests / orders", (runTests ? "PASS" : "OFF") + (simulateOrders ? " / ON" : " / OFF"))
+    f_row(debug, 20, "Historical bar details", "Open Data Window; point at bar")
+
+if (barstate.islastconfirmedhistory or barstate.islast) and showDebug and not isM5
+    f_row(debug, 0, "H1 CHANNELS v2", "INSPECTION / orders OFF")
+    f_row(debug, 1, "H1 trend", (globalTrend == 1 ? "UP" : globalTrend == -1 ? "DOWN" : "UNAVAILABLE") + " / " + trendReason)
+    f_row(debug, 2, "Pivot / lookback / width %", str.tostring(h1Span) + " / " + str.tostring(h1Lookback) + " / " + str.tostring(h1WidthPct))
+    f_row(debug, 3, "Strength minimum / channels", str.tostring(h1MinStrength * 20) + " / " + str.tostring(array.size(h1Zones)))
+    f_row(debug, 4, "Rank: price band", "Strength / pivots / role")
+    for i = 0 to 9
+        Zone z = i < array.size(h1Zones) ? array.get(h1Zones, i) : na
+        f_row(debug, 5 + i, na(z) ? str.tostring(i + 1) + ": —" : str.tostring(i + 1) + ": " + f_price(z.center - z.halfWidth) + " … " + f_price(z.center + z.halfWidth), na(z) ? "—" : str.tostring(z.strength) + " / " + str.tostring(z.pivots) + " / " + (z.side == 1 ? "RES" : z.side == -1 ? "SUP" : "INSIDE"))
+    f_row(debug, 15, "Unit tests", runTests ? "PASS" : "OFF")
+    f_row(debug, 16, "Trading timeframe", "M5 only")
+    f_row(debug, 17, "Last H1 close (UTC)", na(h1ClosedAt) ? "—" : str.format_time(h1ClosedAt, "yyyy-MM-dd HH:mm", "UTC"))
