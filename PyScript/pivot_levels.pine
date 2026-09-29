@@ -1,6 +1,8 @@
 //@version=6
 indicator("Pivot levels — ATR zones v2", overlay = true, max_bars_back = 5000, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 50)
 
+import imbpp123/PivotLevels/1 as levels
+
 int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000)
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50)
 bool showPivots = input.bool(true, "Show all confirmed pivots")
@@ -13,244 +15,134 @@ bool showCandidate = input.bool(true, "Show unfinished candidate")
 bool showDebug = input.bool(true, "Show debug table")
 bool runTests = input.bool(true, "Run built-in unit tests")
 
-// side: -1 = low, 1 = high. knownAt is the pivot confirmation bar.
-type Pivot
-    float price
-    int index
-    int side
-    int knownAt
-    float atr = na
+f_structureLabel(int side, float price, float previousPrice) =>
+    if na(previousPrice)
+        side == 1 ? "HIGH" : "LOW"
+    else if price > previousPrice
+        side == 1 ? "HH" : "HL"
+    else if price < previousPrice
+        side == 1 ? "LH" : "LL"
+    else
+        side == 1 ? "EQH" : "EQL"
 
-type Extreme
-    float price
-    int index
-    int side
-    int fixedAt
-    float atr = na
-
-type Result
-    array<Extreme> fixed
-    Pivot candidate
-    Pivot opposite
-
-f_moreExtreme(Pivot next, Pivot previous) =>
-    next.side * (next.price - previous.price) > 0
-
-// Pure chronological scan. Same-bar high/low pairs are skipped: order is unknown.
-// Equal prices keep the older candidate and do not confirm a reversal.
-f_findExtremes(array<Pivot> pivots) =>
-    array<Extreme> fixed = array.new<Extreme>()
-    Pivot candidate = na
-    Pivot opposite = na
-    int count = array.size(pivots)
-    if count > 0
-        for i = 0 to count - 1
-            Pivot point = array.get(pivots, i)
-            bool samePrevious = i > 0 and array.get(pivots, i - 1).index == point.index
-            bool sameNext = i + 1 < count and array.get(pivots, i + 1).index == point.index
-            if samePrevious or sameNext
-                continue
-            if na(candidate)
-                candidate := point
-            else if point.side == candidate.side
-                if f_moreExtreme(point, candidate)
-                    candidate := point
-                    opposite := na
-                else if point.price != candidate.price and not na(opposite)
-                    // A higher low fixes LOW; a lower high fixes HIGH.
-                    array.push(fixed, Extreme.new(candidate.price, candidate.index, candidate.side, point.knownAt, candidate.atr))
-                    candidate := opposite
-                    opposite := point
-            else if na(opposite) or f_moreExtreme(point, opposite)
-                opposite := point
-    Result.new(fixed, candidate, opposite)
-
-// Zones keep the ATR of their oldest anchor. Merges use the stricter width cap.
-type Zone
-    float bottom
-    float top
-    int side
-    float atr
-    float cap
-    int firstIndex
-    int createdAt
-    int knownAt
-    int latestAnchor
-    int anchors
-    int members = 0
-
-// Grow from the anchor in price-distance order. Ties prefer the lower price.
-f_seedZone(Extreme anchor, array<Pivot> sorted, float factor) =>
-    Zone zone = Zone.new(anchor.price, anchor.price, anchor.side, anchor.atr, anchor.atr * factor, anchor.index, anchor.fixedAt, anchor.fixedAt, anchor.index, 1)
-    int right = 0
-    int count = array.size(sorted)
-    while right < count and array.get(sorted, right).price < anchor.price
-        right += 1
-    int left = right - 1
-    while left >= 0 or right < count
-        bool takeLeft = right >= count or (left >= 0 and anchor.price - array.get(sorted, left).price <= array.get(sorted, right).price - anchor.price)
-        Pivot point = array.get(sorted, takeLeft ? left : right)
-        float bottom = math.min(zone.bottom, point.price)
-        float top = math.max(zone.top, point.price)
-        if top - bottom <= zone.cap + zone.cap * 1e-10
-            zone.bottom := bottom
-            zone.top := top
-        if takeLeft
-            left -= 1
-        else
-            right += 1
-    zone
-
-f_canMerge(Zone a, Zone b) =>
-    float cap = math.min(a.cap, b.cap)
-    a.side == b.side and math.max(a.top, b.top) - math.min(a.bottom, b.bottom) <= cap + cap * 1e-10
-
-// Pure calculation: input pivots and extremes are never changed.
-f_buildZones(array<Pivot> pivots, array<Extreme> anchors, float factor) =>
-    array<float> prices = array.new<float>()
-    for point in pivots
-        array.push(prices, point.price)
-    array<int> order = array.sort_indices(prices)
-    array<Pivot> lows = array.new<Pivot>()
-    array<Pivot> highs = array.new<Pivot>()
-    for i in order
-        Pivot point = array.get(pivots, i)
-        array.push(point.side == -1 ? lows : highs, point)
-    array<Zone> zones = array.new<Zone>()
-    for anchor in anchors
-        // Missing or zero ATR cannot define a price tolerance.
-        if not na(anchor.atr) and anchor.atr > 0 and factor > 0
-            Zone zone = f_seedZone(anchor, anchor.side == -1 ? lows : highs, factor)
-            int i = 0
-            while i < array.size(zones)
-                Zone previous = array.get(zones, i)
-                if f_canMerge(zone, previous)
-                    zone.bottom := math.min(zone.bottom, previous.bottom)
-                    zone.top := math.max(zone.top, previous.top)
-                    zone.cap := math.min(zone.cap, previous.cap)
-                    if previous.createdAt < zone.createdAt
-                        zone.atr := previous.atr
-                    zone.createdAt := math.min(zone.createdAt, previous.createdAt)
-                    zone.knownAt := math.max(zone.knownAt, previous.knownAt)
-                    zone.latestAnchor := math.max(zone.latestAnchor, previous.latestAnchor)
-                    zone.anchors += previous.anchors
-                    array.remove(zones, i)
-                    i := 0
-                else
-                    i += 1
-            array.push(zones, zone)
-    // Count each pivot once, including members shared by merged seed zones.
-    for zone in zones
-        for point in pivots
-            if point.side == zone.side and point.price >= zone.bottom and point.price <= zone.top
-                zone.members += 1
-                zone.firstIndex := math.min(zone.firstIndex, point.index)
-                zone.knownAt := math.max(zone.knownAt, point.knownAt)
-    zones
-
-f_pruneWindow(array<Pivot> pivots, int firstIndex) =>
-    while array.size(pivots) > 0
-        if array.get(pivots, 0).index >= firstIndex
-            break
-        array.shift(pivots)
-    array.size(pivots)
+f_selectedLabel(array<levels.Extreme> fixed, int index) =>
+    levels.Extreme point = array.get(fixed, index)
+    // Fixed extremes alternate; the same side is two positions back, even outside the drawing limit.
+    float previousPrice = index >= 2 ? array.get(fixed, index - 2).price : na
+    f_structureLabel(point.side, point.price, previousPrice)
 
 f_assert(bool condition, string message) =>
     if not condition
         runtime.error("Unit test failed: " + message)
 
+f_structureTests() =>
+    f_assert(f_structureLabel(1, 120, na) == "HIGH", "First high has no comparison")
+    f_assert(f_structureLabel(-1, 100, na) == "LOW", "First low has no comparison")
+    f_assert(f_structureLabel(1, 125, 120) == "HH", "High above previous high")
+    f_assert(f_structureLabel(1, 115, 120) == "LH", "High below previous high")
+    f_assert(f_structureLabel(-1, 105, 100) == "HL", "Low above previous low")
+    f_assert(f_structureLabel(-1, 95, 100) == "LL", "Low below previous low")
+    f_assert(f_structureLabel(1, 120, 120) == "EQH", "Equal highs")
+    f_assert(f_structureLabel(-1, 100, 100) == "EQL", "Equal lows")
+
+    array<levels.Extreme> fixed = array.from(levels.Extreme.new(100, 0, -1, 5), levels.Extreme.new(120, 1, 1, 6), levels.Extreme.new(105, 2, -1, 7), levels.Extreme.new(115, 3, 1, 8))
+    f_assert(f_selectedLabel(fixed, 0) == "LOW" and f_selectedLabel(fixed, 1) == "HIGH", "First extreme of each side has no comparison")
+    f_assert(f_selectedLabel(fixed, 2) == "HL" and f_selectedLabel(fixed, 3) == "LH", "Labels use the same side before the visible range")
+    true
+
 f_unitTests() =>
-    Result empty = f_findExtremes(array.new<Pivot>())
+    levels.Result empty = levels.findExtremes(array.new<levels.Pivot>())
     f_assert(array.size(empty.fixed) == 0 and na(empty.candidate), "Empty input")
-    Result single = f_findExtremes(array.from(Pivot.new(100, 0, -1, 5)))
+    levels.Result single = levels.findExtremes(array.from(levels.Pivot.new(100, 0, -1, 5)))
     f_assert(array.size(single.fixed) == 0 and single.candidate.price == 100, "One pivot remains unfinished")
-    Result descending = f_findExtremes(array.from(Pivot.new(100, 0, -1, 5), Pivot.new(110, 1, 1, 6), Pivot.new(90, 2, -1, 7)))
+    levels.Result descending = levels.findExtremes(array.from(levels.Pivot.new(100, 0, -1, 5), levels.Pivot.new(110, 1, 1, 6), levels.Pivot.new(90, 2, -1, 7)))
     f_assert(array.size(descending.fixed) == 0 and descending.candidate.price == 90 and na(descending.opposite), "Lower low replaces candidate and discards earlier highs")
-    Result ascending = f_findExtremes(array.from(Pivot.new(110, 0, 1, 5), Pivot.new(100, 1, -1, 6), Pivot.new(120, 2, 1, 7)))
+    levels.Result ascending = levels.findExtremes(array.from(levels.Pivot.new(110, 0, 1, 5), levels.Pivot.new(100, 1, -1, 6), levels.Pivot.new(120, 2, 1, 7)))
     f_assert(array.size(ascending.fixed) == 0 and ascending.candidate.price == 120 and na(ascending.opposite), "Higher high replaces candidate and discards earlier lows")
-    Result lowTurn = f_findExtremes(array.from(Pivot.new(100, 0, -1, 5), Pivot.new(115, 1, 1, 6), Pivot.new(120, 2, 1, 7), Pivot.new(105, 3, -1, 8)))
+    levels.Result lowTurn = levels.findExtremes(array.from(levels.Pivot.new(100, 0, -1, 5), levels.Pivot.new(115, 1, 1, 6), levels.Pivot.new(120, 2, 1, 7), levels.Pivot.new(105, 3, -1, 8)))
     f_assert(array.size(lowTurn.fixed) == 1, "Higher low confirms one extreme")
-    Extreme firstLow = array.get(lowTurn.fixed, 0)
+    levels.Extreme firstLow = array.get(lowTurn.fixed, 0)
     f_assert(firstLow.price == 100 and firstLow.side == -1 and firstLow.index == 0 and firstLow.fixedAt == 8, "Low time and confirmation time differ")
     f_assert(lowTurn.candidate.price == 120 and lowTurn.candidate.index == 2 and lowTurn.opposite.price == 105, "Start high search from highest intervening pivot")
-    Result highTurn = f_findExtremes(array.from(Pivot.new(120, 0, 1, 5), Pivot.new(105, 1, -1, 6), Pivot.new(100, 2, -1, 7), Pivot.new(115, 3, 1, 8)))
+    levels.Result highTurn = levels.findExtremes(array.from(levels.Pivot.new(120, 0, 1, 5), levels.Pivot.new(105, 1, -1, 6), levels.Pivot.new(100, 2, -1, 7), levels.Pivot.new(115, 3, 1, 8)))
     f_assert(array.size(highTurn.fixed) == 1 and array.get(highTurn.fixed, 0).price == 120 and highTurn.candidate.price == 100, "Lower high confirms high and keeps lowest intervening pivot")
-    array<Pivot> sequence = array.from(Pivot.new(100, 0, -1, 5), Pivot.new(120, 1, 1, 6), Pivot.new(105, 2, -1, 7), Pivot.new(115, 3, 1, 8), Pivot.new(110, 4, -1, 9))
-    Result alternating = f_findExtremes(sequence)
+    array<levels.Pivot> sequence = array.from(levels.Pivot.new(100, 0, -1, 5), levels.Pivot.new(120, 1, 1, 6), levels.Pivot.new(105, 2, -1, 7), levels.Pivot.new(115, 3, 1, 8), levels.Pivot.new(110, 4, -1, 9))
+    levels.Result alternating = levels.findExtremes(sequence)
     f_assert(array.size(alternating.fixed) == 3, "Three completed extremes")
     f_assert(array.get(alternating.fixed, 0).side == -1 and array.get(alternating.fixed, 1).side == 1 and array.get(alternating.fixed, 2).side == -1, "Low high low alternate")
     f_assert(array.get(alternating.fixed, 2).price == 105 and alternating.candidate.price == 115, "Last high stays unfinished")
     f_assert(array.size(sequence) == 5 and array.get(sequence, 0).price == 100, "Scan leaves input unchanged")
-    Result equalLow = f_findExtremes(array.from(Pivot.new(100, 0, -1, 5), Pivot.new(120, 1, 1, 6), Pivot.new(100, 2, -1, 7)))
+    levels.Result equalLow = levels.findExtremes(array.from(levels.Pivot.new(100, 0, -1, 5), levels.Pivot.new(120, 1, 1, 6), levels.Pivot.new(100, 2, -1, 7)))
     f_assert(array.size(equalLow.fixed) == 0 and equalLow.candidate.index == 0, "Equal low does not confirm reversal")
-    Result equalHigh = f_findExtremes(array.from(Pivot.new(120, 0, 1, 5), Pivot.new(100, 1, -1, 6), Pivot.new(120, 2, 1, 7)))
+    levels.Result equalHigh = levels.findExtremes(array.from(levels.Pivot.new(120, 0, 1, 5), levels.Pivot.new(100, 1, -1, 6), levels.Pivot.new(120, 2, 1, 7)))
     f_assert(array.size(equalHigh.fixed) == 0 and equalHigh.candidate.index == 0, "Equal high does not confirm reversal")
-    Result noOpposite = f_findExtremes(array.from(Pivot.new(100, 0, -1, 5), Pivot.new(105, 1, -1, 6)))
+    levels.Result noOpposite = levels.findExtremes(array.from(levels.Pivot.new(100, 0, -1, 5), levels.Pivot.new(105, 1, -1, 6)))
     f_assert(array.size(noOpposite.fixed) == 0 and noOpposite.candidate.price == 100, "No reversal without an intervening opposite pivot")
-    Result both = f_findExtremes(array.from(Pivot.new(100, 0, -1, 5), Pivot.new(130, 1, 1, 6), Pivot.new(90, 1, -1, 6), Pivot.new(120, 2, 1, 7), Pivot.new(105, 3, -1, 8)))
+    levels.Result both = levels.findExtremes(array.from(levels.Pivot.new(100, 0, -1, 5), levels.Pivot.new(130, 1, 1, 6), levels.Pivot.new(90, 1, -1, 6), levels.Pivot.new(120, 2, 1, 7), levels.Pivot.new(105, 3, -1, 8)))
     f_assert(array.size(both.fixed) == 1 and array.get(both.fixed, 0).price == 100 and both.candidate.price == 120, "Same-bar high and low are excluded from ordering")
-    array<Pivot> window = array.from(Pivot.new(100, 10, -1, 15), Pivot.new(120, 20, 1, 25))
-    f_pruneWindow(window, 10)
+    array<levels.Pivot> window = array.from(levels.Pivot.new(100, 10, -1, 15), levels.Pivot.new(120, 20, 1, 25))
+    levels.pruneWindow(window, 10)
     f_assert(array.size(window) == 2, "Left boundary is included")
-    f_pruneWindow(window, 11)
+    levels.pruneWindow(window, 11)
     f_assert(array.size(window) == 1 and array.get(window, 0).index == 20, "Window uses pivot location, not confirmation time")
-    f_pruneWindow(window, 21)
+    levels.pruneWindow(window, 21)
     f_assert(array.size(window) == 0, "Window can become empty")
     true
 
 f_zoneTests() =>
-    array<Pivot> empty = array.new<Pivot>()
-    array<Extreme> noAnchors = array.new<Extreme>()
-    f_assert(array.size(f_buildZones(empty, noAnchors, 0.5)) == 0, "Empty zones")
-    array<Pivot> lows = array.from(Pivot.new(99, 0, -1, 5), Pivot.new(100, 10, -1, 15), Pivot.new(101, 20, -1, 25), Pivot.new(102, 30, -1, 35), Pivot.new(100, 40, 1, 45))
-    array<Extreme> anchors = array.from(Extreme.new(100, 10, -1, 18, 4))
-    array<Zone> built = f_buildZones(lows, anchors, 0.5)
-    Zone zone = array.get(built, 0)
+    array<levels.Pivot> empty = array.new<levels.Pivot>()
+    array<levels.Extreme> noAnchors = array.new<levels.Extreme>()
+    f_assert(array.size(levels.buildZones(empty, noAnchors, 0.5)) == 0, "Empty zones")
+    array<levels.Pivot> lows = array.from(levels.Pivot.new(99, 0, -1, 5), levels.Pivot.new(100, 10, -1, 15), levels.Pivot.new(101, 20, -1, 25), levels.Pivot.new(102, 30, -1, 35), levels.Pivot.new(100, 40, 1, 45))
+    array<levels.Extreme> anchors = array.from(levels.Extreme.new(100, 10, -1, 18, 4))
+    array<levels.Zone> built = levels.buildZones(lows, anchors, 0.5)
+    levels.Zone zone = array.get(built, 0)
     f_assert(zone.bottom == 99 and zone.top == 101 and zone.members == 3, "Whole width cap rejects a chain and ignores highs")
     f_assert(zone.firstIndex == 0 and zone.createdAt == 18 and zone.knownAt == 25, "Start and knowledge times are separate")
     f_assert(array.get(lows, 0).price == 99 and array.get(anchors, 0).atr == 4, "Zone builder leaves inputs unchanged")
-    f_assert(array.size(f_buildZones(lows, noAnchors, 0.5)) == 0, "Raw pivots cannot create zones")
-    array<Extreme> invalid = array.from(Extreme.new(100, 10, -1, 18), Extreme.new(101, 20, -1, 28, 0))
-    f_assert(array.size(f_buildZones(lows, invalid, 0.5)) == 0, "Missing and zero ATR skip anchors")
-    f_assert(array.size(f_buildZones(lows, anchors, 0)) == 0, "Invalid factor skips zones")
-    array<Pivot> single = array.from(Pivot.new(100, 10, -1, 15))
-    Zone one = array.get(f_buildZones(single, anchors, 0.5), 0)
+    f_assert(array.size(levels.buildZones(lows, noAnchors, 0.5)) == 0, "Raw pivots cannot create zones")
+    array<levels.Extreme> invalid = array.from(levels.Extreme.new(100, 10, -1, 18), levels.Extreme.new(101, 20, -1, 28, 0))
+    f_assert(array.size(levels.buildZones(lows, invalid, 0.5)) == 0, "Missing and zero ATR skip anchors")
+    f_assert(array.size(levels.buildZones(lows, anchors, 0)) == 0, "Invalid factor skips zones")
+    array<levels.Pivot> single = array.from(levels.Pivot.new(100, 10, -1, 15))
+    levels.Zone one = array.get(levels.buildZones(single, anchors, 0.5), 0)
     f_assert(one.bottom == 100 and one.top == 100 and one.members == 1, "Single pivot has zero width")
-    array<Pivot> equal = array.from(Pivot.new(100, 0, -1, 5), Pivot.new(100, 10, -1, 15))
-    f_assert(array.get(f_buildZones(equal, anchors, 0.5), 0).members == 2, "Equal price pivots are counted separately")
-    array<Extreme> pair = array.from(Extreme.new(100, 10, -1, 18, 4), Extreme.new(101, 20, -1, 28, 6))
-    array<Pivot> pairPivots = array.from(Pivot.new(100, 10, -1, 15), Pivot.new(101, 20, -1, 25))
-    array<Zone> merged = f_buildZones(pairPivots, pair, 0.5)
-    Zone combined = array.get(merged, 0)
+    array<levels.Pivot> equal = array.from(levels.Pivot.new(100, 0, -1, 5), levels.Pivot.new(100, 10, -1, 15))
+    f_assert(array.get(levels.buildZones(equal, anchors, 0.5), 0).members == 2, "Equal price pivots are counted separately")
+    array<levels.Extreme> pair = array.from(levels.Extreme.new(100, 10, -1, 18, 4), levels.Extreme.new(101, 20, -1, 28, 6))
+    array<levels.Pivot> pairPivots = array.from(levels.Pivot.new(100, 10, -1, 15), levels.Pivot.new(101, 20, -1, 25))
+    array<levels.Zone> merged = levels.buildZones(pairPivots, pair, 0.5)
+    levels.Zone combined = array.get(merged, 0)
     f_assert(array.size(merged) == 1 and combined.members == 2 and combined.anchors == 2, "Merge counts unique pivots and both anchors")
     f_assert(combined.atr == 4 and combined.cap == 2 and combined.knownAt == 28, "Merge keeps oldest ATR and stricter cap")
-    array<Extreme> narrow = array.from(Extreme.new(100, 10, -1, 18, 1), Extreme.new(101, 20, -1, 28, 6))
-    f_assert(array.size(f_buildZones(pairPivots, narrow, 0.5)) == 2, "Wide ATR cannot expand a narrow older zone")
-    array<Pivot> highs = array.from(Pivot.new(99, 0, 1, 5), Pivot.new(100, 10, 1, 15), Pivot.new(101, 20, 1, 25), Pivot.new(102, 30, 1, 35))
-    Zone resistance = array.get(f_buildZones(highs, array.from(Extreme.new(100, 10, 1, 18, 4)), 0.5), 0)
+    array<levels.Extreme> narrow = array.from(levels.Extreme.new(100, 10, -1, 18, 1), levels.Extreme.new(101, 20, -1, 28, 6))
+    f_assert(array.size(levels.buildZones(pairPivots, narrow, 0.5)) == 2, "Wide ATR cannot expand a narrow older zone")
+    array<levels.Pivot> highs = array.from(levels.Pivot.new(99, 0, 1, 5), levels.Pivot.new(100, 10, 1, 15), levels.Pivot.new(101, 20, 1, 25), levels.Pivot.new(102, 30, 1, 35))
+    levels.Zone resistance = array.get(levels.buildZones(highs, array.from(levels.Extreme.new(100, 10, 1, 18, 4)), 0.5), 0)
     f_assert(resistance.side == 1 and resistance.bottom == 99 and resistance.top == 101, "High zones use the same width rule")
-    array<Extreme> sides = array.from(Extreme.new(100, 10, -1, 18, 4), Extreme.new(100, 40, 1, 48, 4))
-    f_assert(array.size(f_buildZones(lows, sides, 0.5)) == 2, "Support and resistance stay separate")
-    array<Extreme> distant = array.from(Extreme.new(100, 10, -1, 18, 1), Extreme.new(102, 30, -1, 38, 1))
-    f_assert(array.size(f_buildZones(lows, distant, 0.5)) == 2, "Distant zones stay separate")
+    array<levels.Extreme> sides = array.from(levels.Extreme.new(100, 10, -1, 18, 4), levels.Extreme.new(100, 40, 1, 48, 4))
+    f_assert(array.size(levels.buildZones(lows, sides, 0.5)) == 2, "Support and resistance stay separate")
+    array<levels.Extreme> distant = array.from(levels.Extreme.new(100, 10, -1, 18, 1), levels.Extreme.new(102, 30, -1, 38, 1))
+    f_assert(array.size(levels.buildZones(lows, distant, 0.5)) == 2, "Distant zones stay separate")
     true
 
 if barstate.isfirst and runTests
+    f_structureTests()
     f_unitTests()
     f_zoneTests()
 
 float zoneAtr = ta.atr(zoneAtrLength)
 float ph = ta.pivothigh(high, pivotSpan, pivotSpan)
 float pl = ta.pivotlow(low, pivotSpan, pivotSpan)
-var array<Pivot> pivots = array.new<Pivot>()
+var array<levels.Pivot> pivots = array.new<levels.Pivot>()
 var int lastClosed = na
 if barstate.isconfirmed
     lastClosed := bar_index
     if not na(pl)
-        array.push(pivots, Pivot.new(pl, bar_index - pivotSpan, -1, bar_index, zoneAtr[pivotSpan]))
+        array.push(pivots, levels.Pivot.new(pl, bar_index - pivotSpan, -1, bar_index, zoneAtr[pivotSpan]))
     if not na(ph)
-        array.push(pivots, Pivot.new(ph, bar_index - pivotSpan, 1, bar_index, zoneAtr[pivotSpan]))
-    f_pruneWindow(pivots, bar_index - historyBars + 1)
+        array.push(pivots, levels.Pivot.new(ph, bar_index - pivotSpan, 1, bar_index, zoneAtr[pivotSpan]))
+    levels.pruneWindow(pivots, bar_index - historyBars + 1)
 
 // Raw markers are placed at pivot bars, but become available only after confirmation.
 bool rawVisible = showPivots and barstate.isconfirmed and bar_index - pivotSpan >= last_bar_index - historyBars + 1
@@ -276,25 +168,25 @@ if barstate.islastconfirmedhistory or barstate.islast
     array.clear(drawnBoxes)
     array.clear(drawnLines)
     array.clear(drawnLabels)
-    Result result = f_findExtremes(pivots)
-    array<Zone> zones = f_buildZones(pivots, result.fixed, zoneAtrFactor)
+    levels.Result result = levels.findExtremes(pivots)
+    array<levels.Zone> zones = levels.buildZones(pivots, result.fixed, zoneAtrFactor)
     int zoneCount = array.size(zones)
     int count = array.size(result.fixed)
     // Keep the most recent drawings within Pine's object limits. Calculation is complete.
     int firstDraw = math.max(0, count - 400)
     if count > 0
         for i = firstDraw to count - 1
-            Extreme point = array.get(result.fixed, i)
+            levels.Extreme point = array.get(result.fixed, i)
             color pointColor = point.side == 1 ? color.red : color.teal
-            string name = point.side == 1 ? "HIGH" : "LOW"
+            string name = f_selectedLabel(result.fixed, i)
             string tooltip = name + " " + str.tostring(point.price, format.mintick) + "\nPivot bar: " + str.tostring(point.index) + "\nFixed at bar: " + str.tostring(point.fixedAt) + "\nDelay: " + str.tostring(point.fixedAt - point.index) + " bars"
             array.push(drawnLabels, label.new(point.index, point.price, name, style = point.side == 1 ? label.style_label_down : label.style_label_up, color = pointColor, textcolor = color.white, size = size.tiny, tooltip = tooltip))
             if showSwings and i > firstDraw
-                Extreme previous = array.get(result.fixed, i - 1)
+                levels.Extreme previous = array.get(result.fixed, i - 1)
                 array.push(drawnLines, line.new(previous.index, previous.price, point.index, point.price, color = color.gray))
     if showLevels and zoneCount > 0
         for i = math.max(0, zoneCount - levelCount) to zoneCount - 1
-            Zone zone = array.get(zones, i)
+            levels.Zone zone = array.get(zones, i)
             color zoneColor = zone.side == -1 ? color.teal : color.red
             string zoneText = (zone.side == -1 ? "LOW zone" : "HIGH zone") + " | P " + str.tostring(zone.members) + " / E " + str.tostring(zone.anchors)
             if zone.top == zone.bottom
@@ -302,10 +194,10 @@ if barstate.islastconfirmedhistory or barstate.islast
             else
                 array.push(drawnBoxes, box.new(zone.firstIndex, zone.top, lastClosed + 1, zone.bottom, border_color = color.new(zoneColor, 30), extend = extend.right, bgcolor = color.new(zoneColor, 88), text = zoneText, text_size = size.tiny, text_color = zoneColor, text_halign = text.align_right))
     if showCandidate and not na(result.candidate)
-        Pivot candidate = result.candidate
+        levels.Pivot candidate = result.candidate
         array.push(drawnLabels, label.new(candidate.index, candidate.price, candidate.side == 1 ? "HIGH ?" : "LOW ?", style = candidate.side == 1 ? label.style_label_down : label.style_label_up, color = color.orange, textcolor = color.black, size = size.small, tooltip = "Unfinished candidate. It can move or be replaced."))
         if showSwings and count > 0
-            Extreme previous = array.get(result.fixed, count - 1)
+            levels.Extreme previous = array.get(result.fixed, count - 1)
             array.push(drawnLines, line.new(previous.index, previous.price, candidate.index, candidate.price, color = color.orange, style = line.style_dashed))
     if showDebug
         f_row(debug, 0, "PIVOT ZONES v2", "Higher low / lower high")
@@ -318,7 +210,7 @@ if barstate.islastconfirmedhistory or barstate.islast
         f_row(debug, 7, "Opposite candidate", na(result.opposite) ? "—" : str.tostring(result.opposite.price, format.mintick))
         f_row(debug, 8, "Unit tests", runTests ? "PASS" : "OFF")
         f_row(debug, 9, "Zones / shown", str.tostring(zoneCount) + " / " + str.tostring(showLevels ? math.min(zoneCount, levelCount) : 0))
-        Zone latest = zoneCount > 0 ? array.get(zones, zoneCount - 1) : na
+        levels.Zone latest = zoneCount > 0 ? array.get(zones, zoneCount - 1) : na
         f_row(debug, 10, "Latest zone bounds", na(latest) ? "—" : str.tostring(latest.bottom, format.mintick) + " - " + str.tostring(latest.top, format.mintick))
         f_row(debug, 11, "Width / cap in anchor ATR", na(latest) ? "—" : str.tostring((latest.top - latest.bottom) / latest.atr, "#.###") + " / " + str.tostring(latest.cap / latest.atr, "#.###"))
         f_row(debug, 12, "Zone pivots / anchors", na(latest) ? "—" : str.tostring(latest.members) + " / " + str.tostring(latest.anchors))

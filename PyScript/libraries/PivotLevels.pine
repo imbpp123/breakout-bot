@@ -1,0 +1,157 @@
+//@version=6
+// @description Confirmed pivot extremes and ATR zones shared by indicators and strategies.
+library("PivotLevels", overlay = true)
+
+// side: -1 = low, 1 = high. knownAt is the pivot confirmation bar.
+export type Pivot
+    float price
+    int index
+    int side
+    int knownAt
+    float atr = na
+
+export type Extreme
+    float price
+    int index
+    int side
+    int fixedAt
+    float atr = na
+
+export type Result
+    array<Extreme> fixed
+    Pivot candidate
+    Pivot opposite
+
+f_moreExtreme(Pivot next, Pivot previous) =>
+    next.side * (next.price - previous.price) > 0
+
+// Pure chronological scan. Same-bar high/low pairs are skipped: order is unknown.
+// Equal prices keep the older candidate and do not confirm a reversal.
+// @function Finds confirmed extremes in chronological pivots without changing the input.
+// @param pivots Confirmed pivots, oldest first. Same-bar pairs must be adjacent.
+// @returns Fixed extremes and unfinished candidates. Candidates reference input pivots.
+export findExtremes(array<Pivot> pivots) =>
+    array<Extreme> fixed = array.new<Extreme>()
+    Pivot candidate = na
+    Pivot opposite = na
+    int count = array.size(pivots)
+    if count > 0
+        for i = 0 to count - 1
+            Pivot point = array.get(pivots, i)
+            bool samePrevious = i > 0 and array.get(pivots, i - 1).index == point.index
+            bool sameNext = i + 1 < count and array.get(pivots, i + 1).index == point.index
+            if samePrevious or sameNext
+                continue
+            if na(candidate)
+                candidate := point
+            else if point.side == candidate.side
+                if f_moreExtreme(point, candidate)
+                    candidate := point
+                    opposite := na
+                else if point.price != candidate.price and not na(opposite)
+                    // A higher low fixes LOW; a lower high fixes HIGH.
+                    array.push(fixed, Extreme.new(candidate.price, candidate.index, candidate.side, point.knownAt, candidate.atr))
+                    candidate := opposite
+                    opposite := point
+            else if na(opposite) or f_moreExtreme(point, opposite)
+                opposite := point
+    Result.new(fixed, candidate, opposite)
+
+// Zones keep the ATR of their oldest anchor. Merges use the stricter width cap.
+export type Zone
+    float bottom
+    float top
+    int side
+    float atr
+    float cap
+    int firstIndex
+    int createdAt
+    int knownAt
+    int latestAnchor
+    int anchors
+    int members = 0
+
+// Grow from the anchor in price-distance order. Ties prefer the lower price.
+f_seedZone(Extreme anchor, array<Pivot> sorted, float factor) =>
+    Zone zone = Zone.new(anchor.price, anchor.price, anchor.side, anchor.atr, anchor.atr * factor, anchor.index, anchor.fixedAt, anchor.fixedAt, anchor.index, 1)
+    int right = 0
+    int count = array.size(sorted)
+    while right < count and array.get(sorted, right).price < anchor.price
+        right += 1
+    int left = right - 1
+    while left >= 0 or right < count
+        bool takeLeft = right >= count or (left >= 0 and anchor.price - array.get(sorted, left).price <= array.get(sorted, right).price - anchor.price)
+        Pivot point = array.get(sorted, takeLeft ? left : right)
+        float bottom = math.min(zone.bottom, point.price)
+        float top = math.max(zone.top, point.price)
+        if top - bottom <= zone.cap + zone.cap * 1e-10
+            zone.bottom := bottom
+            zone.top := top
+        if takeLeft
+            left -= 1
+        else
+            right += 1
+    zone
+
+f_canMerge(Zone a, Zone b) =>
+    float cap = math.min(a.cap, b.cap)
+    a.side == b.side and math.max(a.top, b.top) - math.min(a.bottom, b.bottom) <= cap + cap * 1e-10
+
+// Pure calculation: input pivots and extremes are never changed.
+// @function Builds ATR zones without changing pivots or anchors.
+// @param pivots Confirmed pivots in the current window.
+// @param anchors Fixed extremes, oldest first, with ATR at the pivot bar.
+// @param factor Maximum whole zone width in anchor ATR units.
+// @returns New zones with their bounds and availability bars.
+export buildZones(array<Pivot> pivots, array<Extreme> anchors, float factor) =>
+    array<float> prices = array.new<float>()
+    for point in pivots
+        array.push(prices, point.price)
+    array<int> order = array.sort_indices(prices)
+    array<Pivot> lows = array.new<Pivot>()
+    array<Pivot> highs = array.new<Pivot>()
+    for i in order
+        Pivot point = array.get(pivots, i)
+        array.push(point.side == -1 ? lows : highs, point)
+    array<Zone> zones = array.new<Zone>()
+    for anchor in anchors
+        // Missing or zero ATR cannot define a price tolerance.
+        if not na(anchor.atr) and anchor.atr > 0 and factor > 0
+            Zone zone = f_seedZone(anchor, anchor.side == -1 ? lows : highs, factor)
+            int i = 0
+            while i < array.size(zones)
+                Zone previous = array.get(zones, i)
+                if f_canMerge(zone, previous)
+                    zone.bottom := math.min(zone.bottom, previous.bottom)
+                    zone.top := math.max(zone.top, previous.top)
+                    zone.cap := math.min(zone.cap, previous.cap)
+                    if previous.createdAt < zone.createdAt
+                        zone.atr := previous.atr
+                    zone.createdAt := math.min(zone.createdAt, previous.createdAt)
+                    zone.knownAt := math.max(zone.knownAt, previous.knownAt)
+                    zone.latestAnchor := math.max(zone.latestAnchor, previous.latestAnchor)
+                    zone.anchors += previous.anchors
+                    array.remove(zones, i)
+                    i := 0
+                else
+                    i += 1
+            array.push(zones, zone)
+    // Count each pivot once, including members shared by merged seed zones.
+    for zone in zones
+        for point in pivots
+            if point.side == zone.side and point.price >= zone.bottom and point.price <= zone.top
+                zone.members += 1
+                zone.firstIndex := math.min(zone.firstIndex, point.index)
+                zone.knownAt := math.max(zone.knownAt, point.knownAt)
+    zones
+
+// @function Removes pivots before the inclusive left window boundary.
+// @param pivots Chronological pivot array. This function changes the array.
+// @param firstIndex First pivot bar to keep, not its confirmation bar.
+// @returns Number of remaining pivots.
+export pruneWindow(array<Pivot> pivots, int firstIndex) =>
+    while array.size(pivots) > 0
+        if array.get(pivots, 0).index >= firstIndex
+            break
+        array.shift(pivots)
+    array.size(pivots)
