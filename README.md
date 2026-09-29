@@ -14,3 +14,10 @@
 3. [Подготовка входа](docs/strategy/03-entry-preparation.md)
 4. [Открытие позиции и ограничение риска](docs/strategy/04-position-and-risk.md)
 5. [Сопровождение и выход](docs/strategy/05-position-management.md)
+
+## Скрипты TradingView
+
+Код Pine Script находится в [PyScript/](PyScript/), документация — в `PyScript/docs/`.
+
+- [Прототип стратегии](PyScript/docs/pine-prototype.md)
+- [Индикатор экстремумов и уровней](PyScript/docs/pivot-levels.md)
