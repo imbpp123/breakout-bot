@@ -36,6 +36,33 @@ export pivot_collect(array<Pivot> pivots, float highSource, float lowSource, flo
         if not na(ph)
             array.push(pivots, Pivot.new(ph, index - span, 1, index, atr[span]))
 
+// @function Keeps the lowest LOW or highest HIGH in each same-side run, scanning newest first.
+// @param pivots Chronological confirmed pivots. Same-bar pairs must be adjacent and are skipped.
+// @returns Independent copies, oldest first. Equal prices keep the newer pivot. Includes both ends.
+export pivot_clean(array<Pivot> pivots) =>
+    array<Pivot> cleaned = array.new<Pivot>()
+    Pivot candidate = na
+    int count = array.size(pivots)
+    if count > 0
+        for step = 0 to count - 1
+            int i = count - 1 - step
+            Pivot point = array.get(pivots, i)
+            bool samePrevious = i > 0 and array.get(pivots, i - 1).index == point.index
+            bool sameNext = i + 1 < count and array.get(pivots, i + 1).index == point.index
+            if samePrevious or sameNext
+                continue
+            if na(candidate)
+                candidate := point
+            else if point.side != candidate.side
+                array.push(cleaned, candidate.copy())
+                candidate := point
+            else if point.side * (point.price - candidate.price) > 0
+                candidate := point
+    if not na(candidate)
+        array.push(cleaned, candidate.copy())
+    array.reverse(cleaned)
+    cleaned
+
 export type Extreme
     float price
     int index
