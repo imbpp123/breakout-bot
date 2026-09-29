@@ -86,6 +86,11 @@ Separate calculations from I/O. Keep business rules and validation directly test
 - Keep comments focused on non-obvious reasons or constraints. Avoid comments that repeat the code.
 - Do not refactor unrelated code, add speculative abstractions, or change production behavior just to satisfy a test.
 
+## Стиль Pine Script
+
+- Главная группировка объявлений библиотеки — по назначению: `Pivot` → `Extreme` → `Zone`. Каждая группа содержит свои структуры и функции целиком; не собирать структуры или функции разных групп в общие блоки. Внутри каждой группы предпочтительный порядок: экспортируемые структуры, приватные структуры, экспортируемые функции, приватные функции. Учитывать зависимости Pine: вызываемая функция должна быть объявлена раньше вызывающей, поэтому необходимые приватные помощники размещаются перед экспортируемыми функциями своей группы. Пустые группы не добавлять.
+- Первый параметр каждой экспортируемой функции — объект или коллекция, над которыми она работает. Например, функции обработки pivot принимают первым параметром `array<Pivot> pivots`. Остальные данные и настройки идут после него.
+
 ## Tests: behavior, not call choreography
 
 Unit tests are required for every non-trivial logic change. Bug fixes need a regression test that demonstrates the failure. Test observable inputs, outputs, state changes, invariants, and errors.
