@@ -127,12 +127,11 @@ export type Zone
     int createdAt
     int knownAt
     int latestAnchor
-    int anchors
     int members = 0
 
 // Grow from the anchor in price-distance order. Ties prefer the lower price.
-f_zone_seed(Extreme anchor, array<Pivot> sorted, float factor) =>
-    Zone zone = Zone.new(anchor.price, anchor.price, anchor.side, anchor.atr, anchor.atr * factor, anchor.index, anchor.fixedAt, anchor.fixedAt, anchor.index, 1)
+f_zone_seed(Extreme anchor, array<Extreme> sorted, float factor) =>
+    Zone zone = Zone.new(anchor.price, anchor.price, anchor.side, anchor.atr, anchor.atr * factor, anchor.index, anchor.fixedAt, anchor.fixedAt, anchor.index)
     int right = 0
     int count = array.size(sorted)
     while right < count and array.get(sorted, right).price < anchor.price
@@ -140,7 +139,7 @@ f_zone_seed(Extreme anchor, array<Pivot> sorted, float factor) =>
     int left = right - 1
     while left >= 0 or right < count
         bool takeLeft = right >= count or (left >= 0 and anchor.price - array.get(sorted, left).price <= array.get(sorted, right).price - anchor.price)
-        Pivot point = array.get(sorted, takeLeft ? left : right)
+        Extreme point = array.get(sorted, takeLeft ? left : right)
         float bottom = math.min(zone.bottom, point.price)
         float top = math.max(zone.top, point.price)
         if top - bottom <= zone.cap + zone.cap * 1e-10
@@ -156,50 +155,58 @@ f_zone_canMerge(Zone a, Zone b) =>
     float cap = math.min(a.cap, b.cap)
     a.side == b.side and math.max(a.top, b.top) - math.min(a.bottom, b.bottom) <= cap + cap * 1e-10
 
-// Pure calculation: input pivots and extremes are never changed.
-// @function Builds ATR zones without changing pivots or anchors.
-// @param pivots Confirmed pivots in the current window.
-// @param anchors Fixed extremes, oldest first, with ATR at the pivot bar.
+// @function Builds ATR zones from fixed extremes only, without changing the input.
+// @param extremes Fixed extremes, oldest first. Duplicate side/index pairs count once.
 // @param factor Maximum whole zone width in anchor ATR units.
-// @returns New zones with their bounds and availability bars.
-export zone_build(array<Pivot> pivots, array<Extreme> anchors, float factor) =>
+// @returns New zones with unique extreme counts and availability bars.
+export zone_build(array<Extreme> extremes, float factor) =>
+    array<Extreme> unique = array.new<Extreme>()
+    int lastLowIndex = na
+    int lastHighIndex = na
+    for point in extremes
+        bool duplicate = point.side == -1 ? point.index == lastLowIndex : point.index == lastHighIndex
+        if not duplicate and not na(point.atr) and point.atr > 0 and factor > 0
+            array.push(unique, point)
+            if point.side == -1
+                lastLowIndex := point.index
+            else
+                lastHighIndex := point.index
     array<float> prices = array.new<float>()
-    for point in pivots
+    for point in unique
         array.push(prices, point.price)
     array<int> order = array.sort_indices(prices)
-    array<Pivot> lows = array.new<Pivot>()
-    array<Pivot> highs = array.new<Pivot>()
+    array<Extreme> lows = array.new<Extreme>()
+    array<Extreme> highs = array.new<Extreme>()
     for i in order
-        Pivot point = array.get(pivots, i)
+        Extreme point = array.get(unique, i)
         array.push(point.side == -1 ? lows : highs, point)
     array<Zone> zones = array.new<Zone>()
-    for anchor in anchors
-        // Missing or zero ATR cannot define a price tolerance.
-        if not na(anchor.atr) and anchor.atr > 0 and factor > 0
-            Zone zone = f_zone_seed(anchor, anchor.side == -1 ? lows : highs, factor)
-            int i = 0
-            while i < array.size(zones)
-                Zone previous = array.get(zones, i)
-                if f_zone_canMerge(zone, previous)
-                    zone.bottom := math.min(zone.bottom, previous.bottom)
-                    zone.top := math.max(zone.top, previous.top)
-                    zone.cap := math.min(zone.cap, previous.cap)
-                    if previous.createdAt < zone.createdAt
-                        zone.atr := previous.atr
-                    zone.createdAt := math.min(zone.createdAt, previous.createdAt)
-                    zone.knownAt := math.max(zone.knownAt, previous.knownAt)
-                    zone.latestAnchor := math.max(zone.latestAnchor, previous.latestAnchor)
-                    zone.anchors += previous.anchors
-                    array.remove(zones, i)
-                    i := 0
-                else
-                    i += 1
-            array.push(zones, zone)
-    // Count each pivot once, including members shared by merged seed zones.
+    for anchor in unique
+        Zone zone = f_zone_seed(anchor, anchor.side == -1 ? lows : highs, factor)
+        int i = 0
+        while i < array.size(zones)
+            Zone previous = array.get(zones, i)
+            if f_zone_canMerge(zone, previous)
+                zone.bottom := math.min(zone.bottom, previous.bottom)
+                zone.top := math.max(zone.top, previous.top)
+                zone.cap := math.min(zone.cap, previous.cap)
+                // Backward snapshots share fixedAt; use the extreme's index to choose the oldest ATR.
+                if previous.firstIndex < zone.firstIndex
+                    zone.atr := previous.atr
+                zone.firstIndex := math.min(zone.firstIndex, previous.firstIndex)
+                zone.createdAt := math.min(zone.createdAt, previous.createdAt)
+                zone.knownAt := math.max(zone.knownAt, previous.knownAt)
+                zone.latestAnchor := math.max(zone.latestAnchor, previous.latestAnchor)
+                array.remove(zones, i)
+                i := 0
+            else
+                i += 1
+        array.push(zones, zone)
+    // Count unique extremes, including points shared by merged seed zones.
     for zone in zones
-        for point in pivots
+        for point in unique
             if point.side == zone.side and point.price >= zone.bottom and point.price <= zone.top
                 zone.members += 1
                 zone.firstIndex := math.min(zone.firstIndex, point.index)
-                zone.knownAt := math.max(zone.knownAt, point.knownAt)
+                zone.knownAt := math.max(zone.knownAt, point.fixedAt)
     zones
