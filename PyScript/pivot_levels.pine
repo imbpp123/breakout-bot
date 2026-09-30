@@ -4,30 +4,34 @@ indicator("Pivot levels — ATR zones v2", overlay = true, max_bars_back = 5000,
 // Publish the updated library first; match this import to its actual version.
 import imbpp123/PivotLevels/5 as levels
 
-int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000)
-int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50)
-string pivotSource = input.string("High/Low", "Pivot source", options = ["High/Low", "Body"])
-bool cleanPivots = input.bool(false, "Clean pivots", tooltip = "Build a zigzag from same-side pivot groups, newest to oldest. Replaces Extreme search method while enabled. Same-bar HIGH/LOW pairs are skipped.")
-string extremeMethod = input.string("Forward", "Extreme search method", options = ["Forward", "Backward"])
-bool filterCoveredExtremes = input.bool(false, "Filter covered extremes")
-bool showPivots = input.bool(true, "Show all confirmed pivots")
-bool showSwings = input.bool(true, "Connect selected extremes")
-bool showLevels = input.bool(true, "Show ATR zones")
-bool hideIntermediateZones = input.bool(false, "Hide intermediate zones")
-int boundaryExtremeCount = input.int(10, "Range extremes", minval = 2, maxval = 1000)
-int levelCount = input.int(20, "Latest zones to show", minval = 1, maxval = 50)
-int zoneAtrLength = input.int(14, "Zone ATR period", minval = 1, maxval = 200)
-float zoneAtrFactor = input.float(0.5, "Maximum zone width, ATR", minval = 0.01, step = 0.05)
-bool showCandidate = input.bool(true, "Show unfinished candidate")
-bool showDebug = input.bool(true, "Show debug table")
-bool runTests = input.bool(true, "Run built-in unit tests")
+int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of closed bars used for pivots, extremes and zones. Older points are removed from the calculation.")
+int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side of a pivot. A pivot becomes available this many bars after its candle closes.")
+string pivotSource = input.string("High/Low", "Pivot source", options = ["High/Low", "Body"], tooltip = "High/Low uses candle wicks. Body uses max(open, close) and min(open, close). ATR still uses full candle ranges.")
+bool cleanPivots = input.bool(false, "Clean pivots", tooltip = "Keep the highest HIGH or lowest LOW in each same-side pivot group, scanning newest first. Equal prices keep the newer point. Same-bar HIGH/LOW pairs are skipped. Applies to pivot markers and the input of extreme search.")
+string extremeMethod = input.string("Forward", "Extreme search method", options = ["Forward", "Backward"], tooltip = "Forward scans oldest to newest. Backward scans newest to oldest and produces a current snapshot. Both use cleaned pivots when Clean pivots is enabled.")
+bool filterCoveredExtremes = input.bool(false, "Filter covered extremes", tooltip = "Remove LOWs crossed below by later closed candle bodies and HIGHs crossed above. Wicks and equal prices do not remove points. Applies to extremes and zone inputs, not pivot markers.")
+bool showPivots = input.bool(true, "Show pivots", tooltip = "Show pivot triangles. With Clean pivots enabled, show only retained pivots. Otherwise show all confirmed pivots. Clean markers share the 500-label budget with extremes; newest markers take priority.")
+bool showExtremes = input.bool(true, "Show extremes", tooltip = "Show extreme labels, connecting lines and the unfinished candidate. Does not change calculations, pivot markers or zones.")
+bool showSwings = input.bool(true, "Connect selected extremes", tooltip = "Connect visible extremes with gray lines and the candidate with a dashed line. Requires Show extremes.")
+bool showLevels = input.bool(true, "Show ATR zones", tooltip = "Show support and resistance zones with at least two extremes of the same side. Does not change the calculation.")
+bool hideIntermediateZones = input.bool(false, "Hide intermediate zones", tooltip = "Display only zones containing the lowest LOW or highest HIGH among the last Range extremes selected points. This can hide every zone of one side. Does not filter extremes.")
+int boundaryExtremeCount = input.int(10, "Range extremes", minval = 2, maxval = 1000, tooltip = "Number of latest selected extremes used by Hide intermediate zones. HIGH and LOW count together. Has no display effect when that option is disabled.")
+int levelCount = input.int(20, "Latest zones to show", minval = 1, maxval = 50, tooltip = "Maximum number of displayed zones, support and resistance combined. Applied after zone visibility filters; keeps the latest zones.")
+int zoneAtrLength = input.int(14, "Zone ATR period", minval = 1, maxval = 200, tooltip = "Period of standard ATR. Each extreme stores ATR from its own candle; it is used to limit zone width.")
+float zoneAtrFactor = input.float(0.5, "Maximum zone width, ATR", minval = 0.01, step = 0.05, tooltip = "Maximum total zone width in anchor ATR units, not an offset from each candle. Merges use the smaller width cap. Overlapping zones may remain separate.")
+bool showCandidate = input.bool(true, "Show unfinished candidate", tooltip = "Show the orange unfinished candidate and its connection when Show extremes is enabled. The candidate can move and does not form zones.")
+bool showDebug = input.bool(true, "Show debug table", tooltip = "Show calculation counts, candidates, zone bounds and test status in the table. Does not change calculations.")
+bool runTests = input.bool(true, "Run built-in unit tests", tooltip = "Run built-in deterministic checks. A failed check stops the indicator with an error. PASS means the enabled checks completed without errors.")
 
-f_cleanResult(array<levels.Pivot> pivots, int evaluatedAt) =>
-    array<levels.Pivot> cleaned = levels.pivot_clean(pivots)
-    array<levels.Extreme> fixed = array.new<levels.Extreme>()
-    for point in cleaned
-        array.push(fixed, levels.Extreme.new(point.price, point.index, point.side, evaluatedAt, point.atr))
-    levels.Result.new(fixed, na, na)
+f_pivotInput(array<levels.Pivot> pivots, bool clean) =>
+    clean ? levels.pivot_clean(pivots) : pivots
+
+f_pivotMarkerStart(int count, int usedLabels) =>
+    math.max(0, count - math.max(0, 500 - usedLabels))
+
+f_findExtremes(array<levels.Pivot> pivots, bool clean, bool backward, int evaluatedAt) =>
+    array<levels.Pivot> source = f_pivotInput(pivots, clean)
+    backward ? levels.extreme_findBackward(source, evaluatedAt) : levels.extreme_findForward(source)
 
 f_pivotSources(float o, float h, float l, float c, bool useBody) =>
     [useBody ? math.max(o, c) : h, useBody ? math.min(o, c) : l]
@@ -165,8 +169,11 @@ f_cleanTests() =>
     f_assert(array.size(single) == 1 and array.get(single, 0).index == 10, "Clean keeps the only pivot")
     // In reverse: LOW 100, LOW 95, HIGH 120, HIGH 130, LOW 90, HIGH 125.
     array<levels.Pivot> source = array.from(levels.Pivot.new(125, 0, 1, 3, 2), levels.Pivot.new(90, 1, -1, 4, 3), levels.Pivot.new(130, 2, 1, 5, 4), levels.Pivot.new(120, 3, 1, 6, 5), levels.Pivot.new(95, 4, -1, 7, 6), levels.Pivot.new(100, 5, -1, 8, 7))
-    array<levels.Pivot> cleaned = levels.pivot_clean(source)
-    f_assert(array.size(cleaned) == 4, "Clean keeps one point per same-side group")
+    array<levels.Pivot> cleaned = f_pivotInput(source, true)
+    f_assert(array.size(cleaned) == 4, "Clean input shared by markers and search keeps one point per group")
+    f_assert(array.size(f_pivotInput(source, false)) == 6, "Disabled cleaning exposes every raw pivot to markers and search")
+    f_assert(f_pivotMarkerStart(600, 0) == 100 and f_pivotMarkerStart(200, 401) == 101, "Marker limit keeps newest pivots within the shared label budget")
+    f_assert(f_pivotMarkerStart(10, 500) == 10 and f_pivotMarkerStart(0, 0) == 0, "Full budget and empty pivots draw no markers")
     f_assert(array.get(cleaned, 0).index == 0 and array.get(cleaned, 1).index == 1 and array.get(cleaned, 2).index == 2 and array.get(cleaned, 3).index == 4, "Clean keeps highest highs and lowest lows in chronological order")
     levels.Pivot copied = array.get(cleaned, 2)
     f_assert(copied.knownAt == 5 and copied.atr == 4, "Clean preserves pivot metadata")
@@ -179,9 +186,17 @@ f_cleanTests() =>
     f_assert(array.size(withoutKnives) == 1 and array.get(withoutKnives, 0).index == 0, "Knife pairs are skipped and do not split a group")
     f_assert(array.size(levels.pivot_clean(array.from(levels.Pivot.new(80, 1, -1, 3), levels.Pivot.new(150, 1, 1, 3)))) == 0, "Only knives produce an empty result")
     array<levels.Pivot> spike = array.from(levels.Pivot.new(90, 0, -1, 2), levels.Pivot.new(150, 1, 1, 3), levels.Pivot.new(100, 2, -1, 4), levels.Pivot.new(120, 3, 1, 5))
-    levels.Result result = f_cleanResult(spike, 10)
-    f_assert(array.size(result.fixed) == 4 and array.get(result.fixed, 1).price == 150, "Lower low cannot discard the high of the preceding group")
-    f_assert(array.get(result.fixed, 1).fixedAt == 10 and na(result.candidate) and na(result.opposite), "Clean zigzag is a snapshot including both ends without unfinished candidates")
+    array<levels.Pivot> spikeCleaned = levels.pivot_clean(spike)
+    f_assert(array.size(spikeCleaned) == 4 and array.get(spikeCleaned, 1).price == 150, "Pivot cleaning preserves the high before a lower low")
+    levels.Result forward = f_findExtremes(spike, true, false, 10)
+    f_assert(array.size(forward.fixed) == 2 and array.get(forward.fixed, 0).price == 90 and array.get(forward.fixed, 1).price == 150, "Clean pivots still require Forward extreme confirmation")
+    f_assert(array.get(forward.fixed, 0).fixedAt == 4 and forward.candidate.price == 100 and forward.opposite.price == 120, "Forward keeps confirmation times and unfinished candidates after cleaning")
+    levels.Result backward = f_findExtremes(spike, true, true, 10)
+    f_assert(array.size(backward.fixed) == 0 and backward.candidate.price == 150 and backward.opposite.price == 90, "Clean pivots still use Backward when selected")
+    levels.Result original = f_findExtremes(spike, false, false, 10)
+    f_assert(array.size(original.fixed) == 2 and original.candidate.price == 100, "Disabled cleaning uses the original search")
+    levels.Result singleResult = f_findExtremes(array.from(levels.Pivot.new(100, 0, -1, 2)), true, false, 10)
+    f_assert(array.size(singleResult.fixed) == 0 and singleResult.candidate.price == 100, "A cleaned singleton remains a candidate, not an extreme")
     true
 
 f_coveredTests() =>
@@ -427,7 +442,7 @@ if barstate.isconfirmed
 [hasHigh, hasLow] = f_confirmedPivotSides(pivots, bar_index)
 
 // Raw markers are placed at pivot bars, but become available only after confirmation.
-bool rawVisible = showPivots and barstate.isconfirmed and bar_index - pivotSpan >= last_bar_index - historyBars + 1
+bool rawVisible = showPivots and not cleanPivots and barstate.isconfirmed and bar_index - pivotSpan >= last_bar_index - historyBars + 1
 plotshape(rawVisible and hasHigh, "Raw pivot high", shape.triangledown, location.abovebar, color.new(color.red, 40), offset = -pivotSpan, size = size.tiny)
 plotshape(rawVisible and hasLow, "Raw pivot low", shape.triangleup, location.belowbar, color.new(color.teal, 40), offset = -pivotSpan, size = size.tiny)
 
@@ -450,15 +465,15 @@ if barstate.islastconfirmedhistory or barstate.islast
     array.clear(drawnBoxes)
     array.clear(drawnLines)
     array.clear(drawnLabels)
-    bool backward = cleanPivots or extremeMethod == "Backward"
-    levels.Result result = cleanPivots ? f_cleanResult(pivots, lastClosed) : backward ? levels.extreme_findBackward(pivots, lastClosed) : levels.extreme_findForward(pivots)
+    bool backward = extremeMethod == "Backward"
+    levels.Result result = f_findExtremes(pivots, cleanPivots, backward, lastClosed)
     array<levels.Extreme> selected = filterCoveredExtremes ? levels.extreme_filterCovered(result.fixed, bodyLows, bodyHighs, lastClosed - array.size(bodyLows) + 1) : result.fixed
     array<levels.Zone> zones = levels.zone_build(selected, zoneAtrFactor)
     int zoneCount = array.size(zones)
     int count = array.size(selected)
     // Keep the most recent drawings within Pine's object limits. Calculation is complete.
     int firstDraw = math.max(0, count - 400)
-    if count > 0
+    if showExtremes and count > 0
         for i = firstDraw to count - 1
             levels.Extreme point = array.get(selected, i)
             color pointColor = point.side == 1 ? color.red : color.teal
@@ -478,19 +493,29 @@ if barstate.islastconfirmedhistory or barstate.islast
                 array.push(drawnLines, line.new(zone.firstIndex, zone.bottom, lastClosed + 1, zone.bottom, extend = extend.right, color = zoneColor, style = line.style_dotted))
             else
                 array.push(drawnBoxes, box.new(zone.firstIndex, zone.top, lastClosed + 1, zone.bottom, border_color = color.new(zoneColor, 30), extend = extend.right, bgcolor = color.new(zoneColor, 88), text = zoneText, text_size = size.tiny, text_color = zoneColor, text_halign = text.align_right))
-    if showCandidate and not na(result.candidate)
+    if showExtremes and showCandidate and not na(result.candidate)
         levels.Pivot candidate = result.candidate
         array.push(drawnLabels, label.new(candidate.index, candidate.price, candidate.side == 1 ? "HIGH ?" : "LOW ?", style = candidate.side == 1 ? label.style_label_down : label.style_label_up, color = color.orange, textcolor = color.black, size = size.small, tooltip = backward ? "Unfinished candidate at the oldest end of the backward scan." : "Unfinished candidate. It can move or be replaced."))
         if showSwings and count > 0 and (not backward or firstDraw == 0)
             levels.Extreme previous = array.get(selected, backward ? 0 : count - 1)
             array.push(drawnLines, line.new(previous.index, previous.price, candidate.index, candidate.price, color = color.orange, style = line.style_dashed))
+    // Historical plotshape markers cannot be removed when a later pivot replaces them.
+    if showPivots and cleanPivots
+        array<levels.Pivot> markerPivots = f_pivotInput(pivots, cleanPivots)
+        int markerCount = array.size(markerPivots)
+        int markerStart = f_pivotMarkerStart(markerCount, array.size(drawnLabels))
+        if markerStart < markerCount
+            for i = markerStart to markerCount - 1
+                levels.Pivot point = array.get(markerPivots, i)
+                bool isHigh = point.side == 1
+                array.push(drawnLabels, label.new(point.index, point.price, "", yloc = isHigh ? yloc.abovebar : yloc.belowbar, style = isHigh ? label.style_triangledown : label.style_triangleup, color = color.new(isHigh ? color.red : color.teal, 40), size = size.tiny, tooltip = "Clean pivot: " + str.tostring(point.price, format.mintick)))
     if showDebug
-        f_row(debug, 0, "PIVOT ZONES v2", (cleanPivots ? "Clean pivots" : extremeMethod) + " / " + pivotSource)
+        f_row(debug, 0, "PIVOT ZONES v2", extremeMethod + " / " + pivotSource + (cleanPivots ? " / Clean" : ""))
         f_row(debug, 1, "Window / pivot span", str.tostring(historyBars) + " / " + str.tostring(pivotSpan))
         f_row(debug, 2, "Closed bars in window", na(lastClosed) ? "0" : str.tostring(math.min(historyBars, lastClosed + 1)))
         f_row(debug, 3, "Raw confirmed pivots", str.tostring(array.size(pivots)))
-        f_row(debug, 4, "Fixed extremes / drawn", str.tostring(count) + " / " + str.tostring(count - firstDraw))
-        f_row(debug, 5, "Searching for", cleanPivots ? "—" : na(result.candidate) ? "First pivot" : result.candidate.side == 1 ? "Maximum HIGH" : "Minimum LOW")
+        f_row(debug, 4, "Fixed extremes / drawn", str.tostring(count) + " / " + str.tostring(showExtremes ? count - firstDraw : 0))
+        f_row(debug, 5, "Searching for", na(result.candidate) ? "First pivot" : result.candidate.side == 1 ? "Maximum HIGH" : "Minimum LOW")
         f_row(debug, 6, "Candidate", na(result.candidate) ? "—" : str.tostring(result.candidate.price, format.mintick))
         f_row(debug, 7, "Opposite candidate", na(result.opposite) ? "—" : str.tostring(result.opposite.price, format.mintick))
         f_row(debug, 8, "Unit tests", runTests ? "PASS" : "OFF")
