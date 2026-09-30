@@ -13,6 +13,25 @@ f_pivot_append(array<Pivot> pivots, float price, int span, int side, bool confir
     if confirmed and not na(price)
         array.push(pivots, Pivot.new(price, index - span, side, index))
 
+f_pivot_price(float source, simple int span, simple int side) =>
+    float candidate = source[span]
+    bool valid = not na(candidate)
+    bool hasStrictNeighbor = false
+    if valid
+        for offset = 0 to span * 2
+            float neighbor = source[offset]
+            if na(neighbor)
+                valid := false
+                break
+            // Float comparisons in Pine round operands to nine decimal places.
+            int order = int(math.sign(candidate - neighbor)) * side
+            if order < 0
+                valid := false
+                break
+            if order > 0
+                hasStrictNeighbor := true
+    valid and hasStrictNeighbor ? candidate : na
+
 // @function Removes pivots before the inclusive left window boundary.
 // @param pivots Chronological pivot array. This function changes the array.
 // @param firstIndex First pivot bar to keep, not its confirmation bar.
@@ -29,7 +48,7 @@ export pivot_pruneWindow(array<Pivot> pivots, int firstIndex) =>
 // @param confirmed Whether the current bar is closed.
 // @param index Current bar index in the source context.
 export pivot_collectHigh(array<Pivot> highPivots, float source, simple int span, bool confirmed, int index) =>
-    float price = ta.pivothigh(source, span, span)
+    float price = f_pivot_price(source, span, 1)
     f_pivot_append(highPivots, price, span, 1, confirmed, index)
 
 // @function Collects confirmed lows without pruning. Call once on every bar and context.
@@ -39,7 +58,7 @@ export pivot_collectHigh(array<Pivot> highPivots, float source, simple int span,
 // @param confirmed Whether the current bar is closed.
 // @param index Current bar index in the source context.
 export pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool confirmed, int index) =>
-    float price = ta.pivotlow(source, span, span)
+    float price = f_pivot_price(source, span, -1)
     f_pivot_append(lowPivots, price, span, -1, confirmed, index)
 
 export type Extreme

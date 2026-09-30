@@ -2,15 +2,11 @@
 indicator("Pivots", overlay = true, max_bars_back = 5000, max_labels_count = 500)
 
 // Publish the updated library first; match this import to its actual version.
-import imbpp123/PivotLevels/6 as levels
+import imbpp123/PivotLevels/7 as levels
 
 int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
 
-f_pivotSources(float openPrice, float closePrice) =>
-    [math.max(openPrice, closePrice), math.min(openPrice, closePrice)]
-
-// Use full wicks for display even when pivot detection uses candle bodies.
 f_markerPrice(float candleHigh, float candleLow, int side) =>
     side == 1 ? candleHigh : candleLow
 
@@ -54,18 +50,6 @@ f_markerPriceTests() =>
     f_assert(f_markerPrice(120, 80, -1) == 80, "Low pointer uses the exact wick low without a gap")
     f_assert(f_markerPrice(100, 100, 1) == 100, "Flat high has no offset")
     f_assert(f_markerPrice(100, 100, -1) == 100, "Flat low has no offset")
-    [bodyHigh, bodyLow] = f_pivotSources(100, 110)
-    f_assert(bodyHigh == 110 and f_markerPrice(120, 80, 1) == 120, "Body high price and pointer wick price stay separate")
-    f_assert(bodyLow == 100 and f_markerPrice(120, 80, -1) == 80, "Body low price and pointer wick price stay separate")
-    true
-
-f_pivotSourceTests() =>
-    [bullHigh, bullLow] = f_pivotSources(100, 110)
-    f_assert(bullHigh == 110 and bullLow == 100, "Bullish body uses close and open")
-    [bearHigh, bearLow] = f_pivotSources(110, 100)
-    f_assert(bearHigh == 110 and bearLow == 100, "Bearish body uses open and close")
-    [dojiHigh, dojiLow] = f_pivotSources(100, 100)
-    f_assert(dojiHigh == 100 and dojiLow == 100, "Doji has equal body bounds")
     true
 
 f_extremeMetadataTests() =>
@@ -184,19 +168,89 @@ f_collectionTests() =>
         f_assert(highPoint.price == 16 and highPoint.side == 1 and highPoint.index == 7 and highPoint.knownAt == 8, "High array stays chronological and keeps its data")
     true
 
+f_pivotCase(string name, array<float> prices, simple int span, array<int> expectedHighs, array<int> expectedLows, simple int blockedConfirmation = -1) =>
+    int count = array.size(prices)
+    float source = bar_index < count ? array.get(prices, bar_index) : na
+    var array<levels.Pivot> highPoints = array.new<levels.Pivot>()
+    var array<levels.Pivot> lowPoints = array.new<levels.Pivot>()
+    levels.pivot_collectHigh(highPoints, source, span, bar_index != blockedConfirmation, bar_index)
+    levels.pivot_collectLow(lowPoints, source, span, bar_index != blockedConfirmation, bar_index)
+
+    if bar_index == count - 1
+        f_assert(array.size(highPoints) == array.size(expectedHighs), name + ": high count")
+        f_assert(array.size(lowPoints) == array.size(expectedLows), name + ": low count")
+        if array.size(highPoints) > 0
+            for position = 0 to array.size(highPoints) - 1
+                levels.Pivot point = array.get(highPoints, position)
+                int expectedIndex = array.get(expectedHighs, position)
+                f_assert(point.index == expectedIndex and point.knownAt == expectedIndex + span and point.side == 1, name + ": high metadata")
+                f_assert(int(math.sign(point.price - array.get(prices, expectedIndex))) == 0, name + ": high price")
+        if array.size(lowPoints) > 0
+            for position = 0 to array.size(lowPoints) - 1
+                levels.Pivot point = array.get(lowPoints, position)
+                int expectedIndex = array.get(expectedLows, position)
+                f_assert(point.index == expectedIndex and point.knownAt == expectedIndex + span and point.side == -1, name + ": low metadata")
+                f_assert(int(math.sign(point.price - array.get(prices, expectedIndex))) == 0, name + ": low price")
+    true
+
+f_pivotContractTests() =>
+    f_pivotCase("Low plateau", array.from(100.0, 99.0, 99.0, 99.0, 101.0), 1, array.new<int>(), array.from(1, 3))
+    f_pivotCase("High plateau", array.from(98.0, 99.0, 99.0, 99.0, 97.0), 1, array.from(1, 3), array.new<int>())
+    f_pivotCase("Flat window", array.from(99.0, 99.0, 99.0, 99.0, 99.0), 1, array.new<int>(), array.new<int>())
+    f_pivotCase("Rising prices", array.from(98.0, 99.0, 100.0), 1, array.new<int>(), array.new<int>())
+    f_pivotCase("Unequal adjacent lows", array.from(100.0, 90.0, 95.0, 100.0, 105.0), 1, array.new<int>(), array.from(1))
+    f_pivotCase("Unequal adjacent highs", array.from(100.0, 110.0, 105.0, 100.0, 95.0), 1, array.from(1), array.new<int>())
+    f_pivotCase("Falling prices", array.from(100.0, 99.0, 98.0), 1, array.new<int>(), array.new<int>())
+    f_pivotCase("Low plateau span two", array.from(10.0, 9.0, 8.0, 8.0, 9.0, 10.0), 2, array.new<int>(), array.from(2, 3))
+    f_pivotCase("High plateau span two", array.from(8.0, 9.0, 10.0, 10.0, 9.0, 8.0), 2, array.from(2, 3), array.new<int>())
+    f_pivotCase("Incomplete window", array.from(10.0, 9.0, 8.0, 9.0), 2, array.new<int>(), array.new<int>())
+    f_pivotCase("Missing left", array.from(float(na), 99.0, 100.0), 1, array.new<int>(), array.new<int>())
+    f_pivotCase("Missing candidate", array.from(100.0, float(na), 101.0), 1, array.new<int>(), array.new<int>())
+    f_pivotCase("Missing right", array.from(100.0, 99.0, float(na)), 1, array.new<int>(), array.new<int>())
+    f_pivotCase("Missing outer neighbor", array.from(float(na), 100.0, 99.0, 101.0, 102.0), 2, array.new<int>(), array.new<int>())
+    f_pivotCase("Missing outer right", array.from(102.0, 100.0, 99.0, 101.0, float(na)), 2, array.new<int>(), array.new<int>())
+    f_pivotCase("Missing high keeps state", array.from(98.0, 99.0, 97.0, float(na), 96.0), 1, array.from(1), array.new<int>())
+    f_pivotCase("Missing window keeps state", array.from(100.0, 99.0, 101.0, float(na), 102.0), 1, array.new<int>(), array.from(1))
+    f_pivotCase("Open confirmation", array.from(100.0, 99.0, 101.0), 1, array.new<int>(), array.new<int>(), 2)
+    f_pivotCase("Strict span three", array.from(10.0, 9.0, 8.0, 7.0, 8.0, 9.0, 10.0), 3, array.new<int>(), array.from(3))
+    f_pivotCase("Exact high", array.from(99.0, 99.0000000001, 99.0), 1, array.from(1), array.new<int>())
+    f_pivotCase("Exact low", array.from(99.0, 98.9999999999, 99.0), 1, array.new<int>(), array.from(1))
+    f_pivotCase("Tiny lower neighbor rejects low", array.from(100.0, 99.0, 98.9999999999), 1, array.new<int>(), array.new<int>())
+    f_pivotCase("Tiny higher neighbor rejects high", array.from(98.0, 99.0, 99.0000000001), 1, array.new<int>(), array.new<int>())
+    true
+
+f_missingSideTests() =>
+    float highSource = switch bar_index
+        0 => 10.0
+        1 => 15.0
+        2 => 12.0
+        => na
+    float lowSource = switch bar_index
+        0 => 8.0
+        1 => float(na)
+        2 => 7.0
+        => na
+    var array<levels.Pivot> highPoints = array.new<levels.Pivot>()
+    var array<levels.Pivot> lowPoints = array.new<levels.Pivot>()
+    levels.pivot_collectHigh(highPoints, highSource, 1, true, bar_index)
+    levels.pivot_collectLow(lowPoints, lowSource, 1, true, bar_index)
+    if bar_index == 2
+        f_assert(array.size(highPoints) == 1 and array.size(lowPoints) == 0, "Missing low source does not block high")
+    true
+
 f_collectionTests()
+f_pivotContractTests()
+f_missingSideTests()
 if barstate.isfirst
     f_markerPriceTests()
-    f_pivotSourceTests()
     f_windowTests()
     f_extremeMetadataTests()
     f_visibleCountsTests()
 
 var array<levels.Pivot> highPivots = array.new<levels.Pivot>()
 var array<levels.Pivot> lowPivots = array.new<levels.Pivot>()
-[highSource, lowSource] = f_pivotSources(open, close)
-levels.pivot_collectHigh(highPivots, highSource, pivotSpan, barstate.isconfirmed, bar_index)
-levels.pivot_collectLow(lowPivots, lowSource, pivotSpan, barstate.isconfirmed, bar_index)
+levels.pivot_collectHigh(highPivots, high, pivotSpan, barstate.isconfirmed, bar_index)
+levels.pivot_collectLow(lowPivots, low, pivotSpan, barstate.isconfirmed, bar_index)
 if barstate.isconfirmed
     levels.pivot_pruneWindow(highPivots, bar_index - historyBars + 1)
     levels.pivot_pruneWindow(lowPivots, bar_index - historyBars + 1)
