@@ -22,6 +22,8 @@ Ask only when a missing decision blocks the current task; continue independent w
 - Communicate with the user in Russian unless requested otherwise. Be brief, direct, and factual. Explain unnecessary complexity or incorrect assumptions without motivational filler.
 - Keep code, comments, and project reports neutral and professional.
 - Write all documents and specifications, including configuration descriptions, in Russian. Write new documentation and documentation updates in Russian. Preserve the meaning of existing requirements when translating them.
+- Сарказм, ирония и шутки в документации недопустимы. Документация должна быть чёткой, сухой, полной в рамках описываемой темы и понятной читателю. Использовать нейтральные формулировки, явно описывать правила, ограничения и допущения.
+- Определения, бизнес-правила, инварианты и алгоритмы описывать независимо от языка программирования и платформы. Синтаксис, конкретные API, подключение и ограничения реализации выносить в отдельную техническую справку со ссылкой на общий контракт. Поведение встроенной функции не считать определением бизнес-правила; неопределённые правила явно отмечать как открытые вопросы.
 
 ## Specifications
 

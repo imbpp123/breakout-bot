@@ -21,5 +21,6 @@
 
 - [Прототип стратегии](PyScript/docs/pine-prototype.md)
 - [Индикатор pivot](PyScript/docs/pivots.md)
-- [Библиотека: тип Pivot и функции сбора](PyScript/docs/pivot-library.md)
+- [Pivot: определение и общий контракт](PyScript/docs/library/pivot.md)
+- [Pivot: реализация библиотеки в Pine Script](PyScript/docs/library/pivot-pine.md)
 - [Индикатор экстремумов и уровней](PyScript/docs/pivot-levels.md)
