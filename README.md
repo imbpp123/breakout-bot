@@ -20,4 +20,5 @@
 Код Pine Script находится в [PyScript/](PyScript/), документация — в `PyScript/docs/`.
 
 - [Прототип стратегии](PyScript/docs/pine-prototype.md)
+- [Индикатор pivot](PyScript/docs/pivots.md)
 - [Индикатор экстремумов и уровней](PyScript/docs/pivot-levels.md)
