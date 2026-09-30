@@ -8,7 +8,10 @@ export type Pivot
     int index
     int side
     int knownAt
-    float atr = na
+
+f_pivot_append(array<Pivot> pivots, float price, int span, int side, bool confirmed, int index) =>
+    if confirmed and not na(price)
+        array.push(pivots, Pivot.new(price, index - span, side, index))
 
 // @function Removes pivots before the inclusive left window boundary.
 // @param pivots Chronological pivot array. This function changes the array.
@@ -19,49 +22,25 @@ export pivot_pruneWindow(array<Pivot> pivots, int firstIndex) =>
             break
         array.shift(pivots)
 
-// @function Calculates pivots on every bar and appends confirmed points without pruning.
-// @param pivots Chronological state owned by the caller. Call once per bar and context.
-// @param highSource High price series.
-// @param lowSource Low price series.
-// @param atr ATR series; the value at the pivot bar is stored.
+// @function Collects confirmed highs without pruning. Call once on every bar and context.
+// @param highPivots Chronological high-only state owned by the caller.
+// @param source High price series, including candle body sources.
 // @param span Positive number of bars on each side of the pivot.
 // @param confirmed Whether the current bar is closed.
 // @param index Current bar index in the source context.
-export pivot_collect(array<Pivot> pivots, float highSource, float lowSource, float atr, simple int span, bool confirmed, int index) =>
-    float ph = ta.pivothigh(highSource, span, span)
-    float pl = ta.pivotlow(lowSource, span, span)
-    if confirmed
-        if not na(pl)
-            array.push(pivots, Pivot.new(pl, index - span, -1, index, atr[span]))
-        if not na(ph)
-            array.push(pivots, Pivot.new(ph, index - span, 1, index, atr[span]))
+export pivot_collectHigh(array<Pivot> highPivots, float source, simple int span, bool confirmed, int index) =>
+    float price = ta.pivothigh(source, span, span)
+    f_pivot_append(highPivots, price, span, 1, confirmed, index)
 
-// @function Keeps the lowest LOW or highest HIGH in each same-side run, scanning newest first.
-// @param pivots Chronological confirmed pivots. Same-bar pairs must be adjacent and are skipped.
-// @returns Independent copies, oldest first. Equal prices keep the newer pivot. Includes both ends.
-export pivot_clean(array<Pivot> pivots) =>
-    array<Pivot> cleaned = array.new<Pivot>()
-    Pivot candidate = na
-    int count = array.size(pivots)
-    if count > 0
-        for step = 0 to count - 1
-            int i = count - 1 - step
-            Pivot point = array.get(pivots, i)
-            bool samePrevious = i > 0 and array.get(pivots, i - 1).index == point.index
-            bool sameNext = i + 1 < count and array.get(pivots, i + 1).index == point.index
-            if samePrevious or sameNext
-                continue
-            if na(candidate)
-                candidate := point
-            else if point.side != candidate.side
-                array.push(cleaned, candidate.copy())
-                candidate := point
-            else if point.side * (point.price - candidate.price) > 0
-                candidate := point
-    if not na(candidate)
-        array.push(cleaned, candidate.copy())
-    array.reverse(cleaned)
-    cleaned
+// @function Collects confirmed lows without pruning. Call once on every bar and context.
+// @param lowPivots Chronological low-only state owned by the caller.
+// @param source Low price series, including candle body sources.
+// @param span Positive number of bars on each side of the pivot.
+// @param confirmed Whether the current bar is closed.
+// @param index Current bar index in the source context.
+export pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool confirmed, int index) =>
+    float price = ta.pivotlow(source, span, span)
+    f_pivot_append(lowPivots, price, span, -1, confirmed, index)
 
 export type Extreme
     float price
@@ -82,7 +61,7 @@ f_extreme_isMoreExtreme(Pivot next, Pivot previous) =>
 // Equal prices keep the older candidate and do not confirm a reversal.
 // @function Finds confirmed extremes in chronological pivots without changing the input.
 // @param pivots Confirmed pivots, oldest first. Same-bar pairs must be adjacent.
-// @returns Fixed extremes and unfinished candidates. Candidates reference input pivots.
+// @returns Fixed extremes without ATR and unfinished candidates. Candidates reference input pivots.
 export extreme_findForward(array<Pivot> pivots) =>
     array<Extreme> fixed = array.new<Extreme>()
     Pivot candidate = na
@@ -103,7 +82,7 @@ export extreme_findForward(array<Pivot> pivots) =>
                     opposite := na
                 else if point.price != candidate.price and not na(opposite)
                     // A higher low fixes LOW; a lower high fixes HIGH.
-                    array.push(fixed, Extreme.new(candidate.price, candidate.index, candidate.side, point.knownAt, candidate.atr))
+                    array.push(fixed, Extreme.new(candidate.price, candidate.index, candidate.side, point.knownAt))
                     candidate := opposite
                     opposite := point
             else if na(opposite) or f_extreme_isMoreExtreme(point, opposite)
@@ -113,7 +92,7 @@ export extreme_findForward(array<Pivot> pivots) =>
 // @function Selects extremes from newest to oldest and returns fixed points oldest first.
 // @param pivots Confirmed pivots, oldest first. Same-bar pairs must be adjacent.
 // @param evaluatedAt Closed bar index of this snapshot, at or after all supplied confirmations.
-// @returns Current reconstruction; fixedAt is the snapshot bar, not a past trading signal.
+// @returns Current reconstruction without ATR; fixedAt is the snapshot bar, not a past trading signal.
 export extreme_findBackward(array<Pivot> pivots, int evaluatedAt) =>
     array<Extreme> fixed = array.new<Extreme>()
     Pivot candidate = na
@@ -134,7 +113,7 @@ export extreme_findBackward(array<Pivot> pivots, int evaluatedAt) =>
                     candidate := point
                     opposite := na
                 else if point.price != candidate.price and not na(opposite)
-                    array.push(fixed, Extreme.new(candidate.price, candidate.index, candidate.side, evaluatedAt, candidate.atr))
+                    array.push(fixed, Extreme.new(candidate.price, candidate.index, candidate.side, evaluatedAt))
                     candidate := opposite
                     opposite := point
             else if na(opposite) or f_extreme_isMoreExtreme(point, opposite)
