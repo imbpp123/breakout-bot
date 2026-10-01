@@ -17,10 +17,10 @@
 
 ## Скрипты TradingView
 
-Код Pine Script находится в [PyScript/](PyScript/), документация — в `PyScript/docs/`.
+Код Pine Script находится в [PyScript/](PyScript/), документация — в `PyScript/docs/` и `docs/library/`.
 
 - [Прототип стратегии](PyScript/docs/pine-prototype.md)
-- [Индикатор pivot](PyScript/docs/pivots.md)
+- [Индикатор pivot](docs/library/pivots.md)
 - [Pivot: определение и общий контракт](PyScript/docs/library/pivot.md)
 - [Pivot: реализация библиотеки в Pine Script](PyScript/docs/library/pivot-pine.md)
 - [Индикатор экстремумов и уровней](PyScript/docs/pivot-levels.md)

@@ -1,55 +1,40 @@
 //@version=6
-indicator("Pivots", overlay = true, max_bars_back = 5000, max_labels_count = 500)
+indicator("Pivots", overlay = true, max_bars_back = 5000)
 
 // Publish the updated library first; match this import to its actual version.
 import imbpp123/PivotLevels/7 as levels
 
 int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
+bool showHighPivots = input.bool(true, "Show high pivots")
+bool showLowPivots = input.bool(true, "Show low pivots")
 
-f_markerPrice(float candleHigh, float candleLow, int side) =>
-    side == 1 ? candleHigh : candleLow
-
-// Select the newest points across both sides without combining their state.
-// When the limit splits a same-bar pair, keep HIGH as in the original drawing order.
-f_visibleCounts(array<levels.Pivot> highPivots, array<levels.Pivot> lowPivots, int limit) =>
-    int highRemaining = array.size(highPivots)
-    int lowRemaining = array.size(lowPivots)
-    int highVisible = 0
-    int lowVisible = 0
-    int totalVisible = math.min(math.max(0, limit), highRemaining + lowRemaining)
-    if totalVisible > 0
-        for step = 0 to totalVisible - 1
-            bool takeHigh = lowRemaining == 0 or (highRemaining > 0 and array.get(highPivots, highRemaining - 1).index >= array.get(lowPivots, lowRemaining - 1).index)
-            if takeHigh
-                highRemaining -= 1
-                highVisible += 1
-            else
-                lowRemaining -= 1
-                lowVisible += 1
-    [highVisible, lowVisible]
-
-f_drawMarkers(array<levels.Pivot> pivots, array<label> markers, int visibleCount, int currentIndex) =>
-    int count = array.size(pivots)
-    if visibleCount > 0
-        for pivotIndex = count - visibleCount to count - 1
-            levels.Pivot point = array.get(pivots, pivotIndex)
-            bool isHigh = point.side == 1
-            string tooltip = (isHigh ? "HIGH" : "LOW") + " " + str.tostring(point.price, format.mintick) + "\nPivot bar: " + str.tostring(point.index) + "\nConfirmed at: " + str.tostring(point.knownAt)
-            int barsAgo = currentIndex - point.index
-            float markerPrice = f_markerPrice(high[barsAgo], low[barsAgo], point.side)
-            label marker = label.new(point.index, markerPrice, "", xloc = xloc.bar_index, yloc = yloc.price, style = isHigh ? label.style_diamond : label.style_diamond, color = isHigh ? color.red : color.teal, size = size.tiny, tooltip = tooltip)
-            array.push(markers, marker)
+f_markerValue(array<levels.Pivot> pivots, int currentIndex, bool confirmed, bool visible) =>
+    float price = na
+    if confirmed and visible and array.size(pivots) > 0
+        levels.Pivot point = array.get(pivots, array.size(pivots) - 1)
+        if point.knownAt == currentIndex
+            price := point.price
+    price
 
 f_assert(bool condition, string message) =>
     if not condition
         runtime.error("Unit test failed: " + message)
 
-f_markerPriceTests() =>
-    f_assert(f_markerPrice(120, 80, 1) == 120, "High pointer uses the exact wick high without a gap")
-    f_assert(f_markerPrice(120, 80, -1) == 80, "Low pointer uses the exact wick low without a gap")
-    f_assert(f_markerPrice(100, 100, 1) == 100, "Flat high has no offset")
-    f_assert(f_markerPrice(100, 100, -1) == 100, "Flat low has no offset")
+f_markerValueTests() =>
+    array<levels.Pivot> empty = array.new<levels.Pivot>()
+    array<levels.Pivot> pivots = array.from(levels.Pivot.new(120, 2, 1, 3), levels.Pivot.new(130, 4, 1, 5))
+    f_assert(na(f_markerValue(empty, 5, true, true)), "Empty history has no marker")
+    f_assert(f_markerValue(pivots, 5, true, true) == 130, "New confirmation shows the exact pivot price")
+    f_assert(na(f_markerValue(pivots, 6, true, true)), "Old confirmation is not drawn again")
+    f_assert(na(f_markerValue(pivots, 5, false, true)), "Open bar has no new marker")
+    f_assert(na(f_markerValue(pivots, 5, true, false)), "Disabled side has no marker")
+
+    array<levels.Pivot> manyPivots = array.new<levels.Pivot>()
+    for pointIndex = 0 to 600
+        array.push(manyPivots, levels.Pivot.new(120, pointIndex, -1, pointIndex + 1))
+        f_assert(f_markerValue(manyPivots, pointIndex + 1, true, true) == 120, "Every confirmation is visible beyond 500 points")
+    f_assert(array.size(manyPivots) == 601 and array.size(pivots) == 2, "Drawing leaves pivot state unchanged")
     true
 
 f_extremeMetadataTests() =>
@@ -83,34 +68,6 @@ f_windowTests() =>
     levels.pivot_pruneWindow(highPivots, 11)
     levels.pivot_pruneWindow(lowPivots, 11)
     f_assert(array.size(highPivots) == 0 and array.size(lowPivots) == 0, "Expired and empty arrays are safe to prune")
-    true
-
-f_visibleCountsTests() =>
-    array<levels.Pivot> empty = array.new<levels.Pivot>()
-    [emptyHigh, emptyLow] = f_visibleCounts(empty, empty, 500)
-    f_assert(emptyHigh == 0 and emptyLow == 0, "Empty arrays have no visible points")
-
-    array<levels.Pivot> highPivots = array.from(levels.Pivot.new(120, 2, 1, 3), levels.Pivot.new(130, 4, 1, 5))
-    array<levels.Pivot> lowPivots = array.from(levels.Pivot.new(90, 1, -1, 2), levels.Pivot.new(95, 3, -1, 4), levels.Pivot.new(100, 4, -1, 5))
-    [allHigh, allLow] = f_visibleCounts(highPivots, lowPivots, 500)
-    f_assert(allHigh == 2 and allLow == 3, "Small arrays show all points")
-    [latestHigh, latestLow] = f_visibleCounts(highPivots, lowPivots, 3)
-    f_assert(latestHigh == 1 and latestLow == 2, "Shared limit selects the latest bars across both arrays")
-    [tieHigh, tieLow] = f_visibleCounts(highPivots, lowPivots, 1)
-    f_assert(tieHigh == 1 and tieLow == 0, "A split same-bar pair keeps high as before")
-    [onlyHigh, noLow] = f_visibleCounts(highPivots, empty, 1)
-    f_assert(onlyHigh == 1 and noLow == 0, "High-only history uses the budget")
-    [noHigh, onlyLow] = f_visibleCounts(empty, lowPivots, 2)
-    f_assert(noHigh == 0 and onlyLow == 2, "Low-only history uses the budget")
-    [zeroHigh, zeroLow] = f_visibleCounts(highPivots, lowPivots, 0)
-    f_assert(zeroHigh == 0 and zeroLow == 0, "Zero budget draws nothing")
-
-    array<levels.Pivot> manyHighs = array.new<levels.Pivot>()
-    for pointIndex = 0 to 500
-        array.push(manyHighs, levels.Pivot.new(120, pointIndex, 1, pointIndex + 1))
-    [limitedHigh, limitedLow] = f_visibleCounts(manyHighs, empty, 500)
-    f_assert(limitedHigh == 500 and limitedLow == 0, "More than 500 points respect the label budget")
-    f_assert(array.size(highPivots) == 2 and array.size(lowPivots) == 3 and array.size(manyHighs) == 501, "Visibility leaves pivot state unchanged")
     true
 
 // Synthetic series use the chart collector on every bar, including confirmation checks.
@@ -242,10 +199,9 @@ f_collectionTests()
 f_pivotContractTests()
 f_missingSideTests()
 if barstate.isfirst
-    f_markerPriceTests()
+    f_markerValueTests()
     f_windowTests()
     f_extremeMetadataTests()
-    f_visibleCountsTests()
 
 var array<levels.Pivot> highPivots = array.new<levels.Pivot>()
 var array<levels.Pivot> lowPivots = array.new<levels.Pivot>()
@@ -255,12 +211,15 @@ if barstate.isconfirmed
     levels.pivot_pruneWindow(highPivots, bar_index - historyBars + 1)
     levels.pivot_pruneWindow(lowPivots, bar_index - historyBars + 1)
 
-var array<label> markers = array.new<label>()
-if barstate.islastconfirmedhistory or barstate.islast
-    for marker in markers
-        label.delete(marker)
-    array.clear(markers)
+float highMarker = f_markerValue(highPivots, bar_index, barstate.isconfirmed, showHighPivots)
+float lowMarker = f_markerValue(lowPivots, bar_index, barstate.isconfirmed, showLowPivots)
+int confirmationWindow = historyBars - pivotSpan
 
-    [highVisible, lowVisible] = f_visibleCounts(highPivots, lowPivots, 500)
-    f_drawMarkers(highPivots, markers, highVisible, bar_index)
-    f_drawMarkers(lowPivots, markers, lowVisible, bar_index)
+plotshape(confirmationWindow > 0 ? highMarker : na, title = "High pivots", style = shape.diamond, location = location.absolute, color = color.red, offset = -pivotSpan, size = size.tiny, show_last = math.max(1, confirmationWindow))
+plotshape(confirmationWindow > 0 ? lowMarker : na, title = "Low pivots", style = shape.diamond, location = location.absolute, color = color.teal, offset = -pivotSpan, size = size.tiny, show_last = math.max(1, confirmationWindow))
+
+// An open bar must not move the window past the oldest retained closed bar.
+float highBoundary = not barstate.isconfirmed ? highMarker[confirmationWindow] : na
+float lowBoundary = not barstate.isconfirmed ? lowMarker[confirmationWindow] : na
+plotshape(highBoundary, title = "High pivot at window boundary", style = shape.diamond, location = location.absolute, color = color.red, offset = -historyBars, size = size.tiny, show_last = 1)
+plotshape(lowBoundary, title = "Low pivot at window boundary", style = shape.diamond, location = location.absolute, color = color.teal, offset = -historyBars, size = size.tiny, show_last = 1)
