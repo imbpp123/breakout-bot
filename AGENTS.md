@@ -19,7 +19,7 @@ Ask only when a missing decision blocks the current task; continue independent w
 
 - Use simple, clear language. Use level B1 English where English is required.
 - Use English for code, identifiers, code comments, tests, test names, fixtures written for this project, logs, error messages, commit messages, and pull requests.
-- Communicate with the user in Russian unless requested otherwise. Be brief, direct, and factual. Explain unnecessary complexity or incorrect assumptions without motivational filler.
+- Общаться с пользователем на русском, если не запрошен другой язык. Писать лаконично и точно: сначала результат или вывод, затем только необходимые факты. Не повторять сказанное, не добавлять вводные фразы, мотивационные формулировки и объяснения очевидного. Подробности давать по запросу или когда без них непонятны решение, ограничение или риск. Краткость не должна скрывать существенные факты и допущения.
 - Keep code, comments, and project reports neutral and professional.
 - Write all documents and specifications, including configuration descriptions, in Russian. Write new documentation and documentation updates in Russian. Preserve the meaning of existing requirements when translating them.
 - Сарказм, ирония и шутки в документации недопустимы. Документация должна быть чёткой, сухой, полной в рамках описываемой темы и понятной читателю. Использовать нейтральные формулировки, явно описывать правила, ограничения и допущения.
