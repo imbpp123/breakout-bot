@@ -1,5 +1,5 @@
 //@version=6
-indicator("Pivots", overlay = true, max_bars_back = 5000)
+indicator("Pivots", overlay = true, max_bars_back = 5000, max_lines_count = 500)
 
 // side: -1 = low, 1 = high. knownAt is the pivot confirmation bar.
 type Pivot
@@ -49,6 +49,8 @@ int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
 bool showHighPivots = input.bool(true, "Show high pivots")
 bool showLowPivots = input.bool(true, "Show low pivots")
+color highLevelColor = input.color(color.red, "High pivot level color")
+color lowLevelColor = input.color(color.teal, "Low pivot level color")
 
 f_markerValue(array<Pivot> pivots, int currentIndex, bool confirmed, bool visible) =>
     float price = na
@@ -78,3 +80,25 @@ float highBoundary = not barstate.isconfirmed ? highMarker[confirmationWindow] :
 float lowBoundary = not barstate.isconfirmed ? lowMarker[confirmationWindow] : na
 plotshape(highBoundary, title = "High pivot at window boundary", style = shape.diamond, location = location.absolute, color = color.red, offset = -historyBars, size = size.tiny, show_last = 1)
 plotshape(lowBoundary, title = "Low pivot at window boundary", style = shape.diamond, location = location.absolute, color = color.teal, offset = -historyBars, size = size.tiny, show_last = 1)
+
+var array<line> drawnLevels = array.new<line>()
+
+if barstate.islastconfirmedhistory or barstate.islast
+    for drawing in drawnLevels
+        line.delete(drawing)
+    array.clear(drawnLevels)
+
+    int highIndex = showHighPivots ? array.size(highPivots) - 1 : -1
+    int lowIndex = showLowPivots ? array.size(lowPivots) - 1 : -1
+
+    // Keep the latest visible levels within Pine's shared limit for both sides.
+    while array.size(drawnLevels) < 500 and (highIndex >= 0 or lowIndex >= 0)
+        bool isHigh = lowIndex < 0 or (highIndex >= 0 and array.get(highPivots, highIndex).index >= array.get(lowPivots, lowIndex).index)
+        Pivot point = isHigh ? array.get(highPivots, highIndex) : array.get(lowPivots, lowIndex)
+        color levelColor = isHigh ? highLevelColor : lowLevelColor
+        array.push(drawnLevels, line.new(point.index, point.price, bar_index, point.price, extend = extend.none, color = levelColor, style = line.style_arrow_right))
+
+        if isHigh
+            highIndex -= 1
+        else
+            lowIndex -= 1
