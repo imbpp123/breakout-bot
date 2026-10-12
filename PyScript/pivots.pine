@@ -88,6 +88,9 @@ f_windowTests() =>
     f_assert(array.size(highPivots) == 2 and array.size(lowPivots) == 2, "Both arrays keep their inclusive pivot window boundary")
     f_assert(array.get(highPivots, 0).price == 120 and array.get(lowPivots, 0).price == 95, "Same-bar high and low stay independent")
     f_assert(array.get(lowPivots, 1).knownAt == 11, "Window preserves confirmation data")
+    f_pivot_pruneWindow(highPivots, 8)
+    f_pivot_pruneWindow(lowPivots, 8)
+    f_assert(array.size(highPivots) == 2 and array.size(lowPivots) == 2, "Repeated pruning keeps points on the boundary")
     f_pivot_pruneWindow(lowPivots, 10)
     f_assert(array.size(lowPivots) == 0 and array.size(highPivots) == 2, "Pruning one side does not change the other")
     f_pivot_pruneWindow(highPivots, 11)
@@ -220,9 +223,31 @@ f_missingSideTests() =>
         f_assert(array.size(highPoints) == 1 and array.size(lowPoints) == 0, "Missing low source does not block high")
     true
 
+f_missingHighSideTests() =>
+    float highSource = switch bar_index
+        0 => 10.0
+        1 => float(na)
+        2 => 12.0
+        => na
+    float lowSource = switch bar_index
+        0 => 8.0
+        1 => 4.0
+        2 => 7.0
+        => na
+    var array<Pivot> highPoints = array.new<Pivot>()
+    var array<Pivot> lowPoints = array.new<Pivot>()
+    f_pivot_collectHigh(highPoints, highSource, 1, true, bar_index)
+    f_pivot_collectLow(lowPoints, lowSource, 1, true, bar_index)
+    if bar_index == 2
+        f_assert(array.size(highPoints) == 0 and array.size(lowPoints) == 1, "Missing high source does not block low")
+        Pivot point = array.get(lowPoints, 0)
+        f_assert(point.price == 4 and point.index == 1 and point.knownAt == 2 and point.side == -1, "Low keeps its price and metadata when high is missing")
+    true
+
 f_collectionTests()
 f_pivotContractTests()
 f_missingSideTests()
+f_missingHighSideTests()
 if barstate.isfirst
     f_markerValueTests()
     f_windowTests()
