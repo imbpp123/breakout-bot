@@ -1,0 +1,462 @@
+//@version=6
+indicator("Zones", overlay = true, max_bars_back = 5000, max_boxes_count = 200)
+
+// Keep the library version aligned with pivots.pine.
+import imbpp123/PivotLevels/7 as levels
+
+int historyBars = input.int(1000, "Zone lifetime, bars", minval = 50, maxval = 3000)
+int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50)
+int atrPeriod = input.int(14, "ATR period", minval = 1, maxval = 200)
+float widthFactor = input.float(0.5, "Half width, ATR", minval = 0.01, maxval = 10, step = 0.05)
+int zoneLimit = input.int(100, "Maximum stored zones", minval = 2, maxval = 200)
+bool runTests = input.bool(true, "Run built-in unit tests")
+
+// Pivot
+
+f_newPivot(array<levels.Pivot> points, array<levels.Pivot> source, int currentIndex) =>
+    if array.size(source) > 0
+        levels.Pivot point = array.get(source, array.size(source) - 1)
+        if point.knownAt == currentIndex
+            array.push(points, point)
+    true
+
+// Zone
+
+type Candle
+    int index
+    int stamp
+    float openPrice
+    float highPrice
+    float lowPrice
+    float closePrice
+
+type Touch
+    int firstIndex
+    int lastIndex
+    int closedAt
+    array<Candle> candles
+    array<levels.Pivot> pivots
+    levels.Pivot rebound
+
+type Zone
+    int side
+    int sourceIndex
+    int createdAt
+    float initialLower
+    float initialUpper
+    float lower
+    float upper
+    array<levels.Pivot> pivots
+    array<Touch> touches
+    int completed = 0
+    int rebounds = 0
+    int visibleTime = na
+
+f_order(float a, float b) =>
+    int(math.sign(a - b))
+
+f_inside(float price, float lower, float upper) =>
+    f_order(price, lower) >= 0 and f_order(price, upper) <= 0
+
+f_intersects(Candle candle, Zone zone) =>
+    f_order(candle.lowPrice, zone.upper) <= 0 and f_order(candle.highPrice, zone.lower) >= 0
+
+f_zoneBar(Zone zone, Candle candle) =>
+    int count = array.size(zone.touches)
+    Touch active = count > 0 ? array.get(zone.touches, count - 1) : na
+    bool hasActive = not na(active) and na(active.closedAt)
+    if f_intersects(candle, zone)
+        if not hasActive
+            active := Touch.new(candle.index, candle.index, na, array.new<Candle>(), array.new<levels.Pivot>(), na)
+            array.push(zone.touches, active)
+        array.push(active.candles, candle)
+        active.lastIndex := candle.index
+    else if hasActive
+        active.closedAt := candle.index
+        zone.completed += 1
+
+    if zone.completed > 2 and na(zone.visibleTime)
+        zone.visibleTime := candle.stamp
+
+    float bodyLower = math.min(candle.openPrice, candle.closePrice)
+    float bodyUpper = math.max(candle.openPrice, candle.closePrice)
+    if f_order(bodyUpper, bodyLower) > 0
+        if zone.side == 1 and f_order(bodyLower, zone.lower) <= 0 and f_order(bodyUpper, zone.lower) > 0
+            zone.lower := bodyUpper
+        if zone.side == -1 and f_order(bodyUpper, zone.upper) >= 0 and f_order(bodyLower, zone.upper) < 0
+            zone.upper := bodyLower
+    f_order(zone.lower, zone.upper) < 0
+
+f_zoneAttach(Zone zone, levels.Pivot point) =>
+    array.push(zone.pivots, point)
+    if zone.side == 1
+        zone.lower := math.min(zone.lower, point.price)
+    else
+        zone.upper := math.max(zone.upper, point.price)
+    // A late pivot does not change the recorded candle runs.
+    for touch in zone.touches
+        if point.index >= touch.firstIndex and point.index <= touch.lastIndex
+            array.push(touch.pivots, point)
+            break
+    true
+
+f_zoneSeed(levels.Pivot point, float sourceAtr, float factor, array<Candle> recent) =>
+    Zone result = na
+    if not na(sourceAtr) and f_order(sourceAtr, 0) > 0 and not na(factor) and f_order(factor, 0) > 0
+        float lower = point.price - sourceAtr * factor
+        float upper = point.price + sourceAtr * factor
+        if f_order(lower, upper) < 0
+            result := Zone.new(point.side, point.index, point.knownAt, lower, upper, lower, upper, array.new<levels.Pivot>(), array.new<Touch>())
+            for candle in recent
+                // The current confirmation candle is processed once by the common step.
+                if candle.index >= point.index and candle.index < point.knownAt
+                    if not f_zoneBar(result, candle)
+                        result := na
+                        break
+            if not na(result)
+                f_zoneAttach(result, point)
+                // Replayed touches become available only at seed confirmation.
+                result.visibleTime := na
+    result
+
+f_zoneMatch(array<Zone> zones, levels.Pivot point) =>
+    int match = -1
+    int originalMatch = -1
+    int count = array.size(zones)
+    if count > 0
+        for i = 0 to count - 1
+            Zone zone = array.get(zones, i)
+            if zone.side == point.side
+                if f_inside(point.price, zone.lower, zone.upper)
+                    match := i
+                    break
+                if originalMatch == -1 and f_inside(point.price, zone.initialLower, zone.initialUpper)
+                    originalMatch := i
+    match >= 0 ? match : originalMatch
+
+f_zoneRebound(Zone zone, levels.Pivot point) =>
+    bool outside = zone.side == 1 ? f_order(point.price, zone.lower) < 0 : f_order(point.price, zone.upper) > 0
+    bool eligible = point.side == zone.side and outside and not f_inside(point.price, zone.initialLower, zone.initialUpper)
+    int count = array.size(zone.touches)
+    if eligible and count > 0
+        for offset = 0 to count - 1
+            Touch touch = array.get(zone.touches, count - 1 - offset)
+            if touch.firstIndex <= point.index
+                if not na(touch.closedAt) and touch.closedAt <= point.index and na(touch.rebound)
+                    touch.rebound := point
+                    zone.rebounds += 1
+                // One pivot can confirm only the most recent preceding touch per zone.
+                break
+    true
+
+f_zonePrune(array<Zone> zones, int firstIndex, int limit) =>
+    while array.size(zones) > 0
+        Zone first = array.get(zones, 0)
+        if first.sourceIndex >= firstIndex and array.size(zones) <= limit
+            break
+        array.shift(zones)
+    true
+
+f_zoneStep(array<Zone> zones, array<Candle> recent, Candle candle, array<levels.Pivot> points, float sourceAtr, float factor, int span, int lifetime, int limit, bool confirmed) =>
+    bool processed = false
+    bool newBar = array.size(recent) == 0 or array.get(recent, array.size(recent) - 1).index < candle.index
+    if confirmed and newBar
+        processed := true
+        array.push(recent, candle)
+        while array.size(recent) > span + 1
+            array.shift(recent)
+        int firstIndex = candle.index - lifetime + 1
+        f_zonePrune(zones, firstIndex, limit)
+
+        for point in points
+            if point.knownAt == candle.index and point.index >= firstIndex
+                int match = f_zoneMatch(zones, point)
+                if match >= 0
+                    f_zoneAttach(array.get(zones, match), point)
+                else
+                    Zone seed = f_zoneSeed(point, sourceAtr, factor, recent)
+                    if not na(seed)
+                        array.push(zones, seed)
+        f_zonePrune(zones, firstIndex, limit)
+
+        int i = array.size(zones) - 1
+        while i >= 0
+            if not f_zoneBar(array.get(zones, i), candle)
+                array.remove(zones, i)
+            i -= 1
+
+        for point in points
+            if point.knownAt == candle.index and point.index >= firstIndex
+                for zone in zones
+                    f_zoneRebound(zone, point)
+    processed
+
+f_zoneVisible(Zone zone) =>
+    zone.completed > 2 and not na(zone.visibleTime)
+
+f_zoneColor(Zone zone) =>
+    zone.side == -1 ? color.green : color.red
+
+f_draw(array<box> bands, array<Zone> zones, int rightTime) =>
+    for band in bands
+        box.delete(band)
+    array.clear(bands)
+    for zone in zones
+        if f_zoneVisible(zone)
+            color shade = f_zoneColor(zone)
+            array.push(bands, box.new(left = zone.visibleTime, top = zone.upper, right = rightTime, bottom = zone.lower, xloc = xloc.bar_time, extend = extend.right, border_width = 0, bgcolor = color.new(shade, 80)))
+    true
+
+// Unit tests use the same state transitions as the chart.
+f_assert(bool condition, string message) =>
+    if not condition
+        runtime.error("Zones unit test failed: " + message)
+
+f_testZone(int side = 1) =>
+    Zone.new(side, 0, 1, 100, 105, 100, 105, array.new<levels.Pivot>(), array.new<Touch>())
+
+f_testCandle(int index, float lowPrice, float highPrice, float openPrice, float closePrice) =>
+    Candle.new(index, index * 60000, openPrice, highPrice, lowPrice, closePrice)
+
+f_touchTests() =>
+    Zone zone = f_testZone()
+    f_zoneBar(zone, f_testCandle(0, 98, 100, 98, 99))
+    f_zoneBar(zone, f_testCandle(1, 99, 103, 99, 99))
+    f_assert(array.size(zone.touches) == 1 and array.size(array.get(zone.touches, 0).candles) == 2, "Equal edge and wick share one touch")
+    f_assert(zone.lower == 100 and zone.upper == 105 and zone.completed == 0, "Wicks do not trim or finish a touch")
+    f_zoneBar(zone, f_testCandle(2, 97, 99, 98, 99))
+    Touch first = array.get(zone.touches, 0)
+    f_assert(first.closedAt == 2 and first.lastIndex == 1 and zone.completed == 1 and na(first.rebound), "A gap ends the touch without a rebound")
+    f_zoneBar(zone, f_testCandle(3, 99, 101, 99, 99))
+    f_assert(array.size(zone.touches) == 2 and array.get(zone.touches, 1).firstIndex == 3, "A new approach creates a separate touch")
+    true
+
+f_visibilityTests() =>
+    Zone zone = f_testZone()
+    for i = 0 to 2
+        f_zoneBar(zone, f_testCandle(i * 2, 99, 101, 99, 99))
+        f_assert(not f_zoneVisible(zone), "An active third touch is not enough")
+        f_zoneBar(zone, f_testCandle(i * 2 + 1, 97, 99, 98, 99))
+        f_assert(f_zoneVisible(zone) == (i == 2), "Only three completed touches show a band")
+    f_assert(zone.visibleTime == 300000 and zone.rebounds == 0, "Visibility starts at the third completion without requiring rebounds")
+    f_assert(f_zoneColor(f_testZone(-1)) == color.green and f_zoneColor(zone) == color.red, "Support is green and resistance is red")
+    true
+
+f_trimTests() =>
+    Zone resistance = f_testZone()
+    f_assert(f_zoneBar(resistance, f_testCandle(0, 99, 103, 99, 102)) and resistance.lower == 102, "Resistance trims from below")
+    f_assert(f_zoneBar(resistance, f_testCandle(1, 101, 105, 102, 104)) and resistance.lower == 104, "Body contact continues trimming")
+    f_assert(not f_zoneBar(resistance, f_testCandle(2, 103, 106, 104, 105)), "Equality at the far edge removes resistance")
+    Zone support = f_testZone(-1)
+    f_assert(f_zoneBar(support, f_testCandle(0, 102, 106, 103, 106)) and support.upper == 103, "Support trims from above")
+    f_assert(not f_zoneBar(support, f_testCandle(1, 99, 104, 100, 103)), "Support also breaks at equality")
+    true
+
+f_bodyEdgeTests() =>
+    Zone inside = f_testZone()
+    f_zoneBar(inside, f_testCandle(0, 101, 104, 102, 103))
+    f_assert(inside.lower == 100, "An internal body does not cross the approach edge")
+    Zone gap = f_testZone()
+    f_zoneBar(gap, f_testCandle(0, 106, 108, 106, 107))
+    f_assert(gap.lower == 100 and array.size(gap.touches) == 0, "A gap over the zone does not cover its range")
+    Zone doji = f_testZone()
+    f_zoneBar(doji, f_testCandle(0, 99, 103, 102, 102))
+    f_assert(doji.lower == 100 and array.size(doji.touches) == 1, "A doji can touch but cannot trim")
+    true
+
+f_matchTests() =>
+    Zone oldest = f_testZone()
+    oldest.lower := 103
+    Zone current = f_testZone()
+    current.lower := 101
+    array<Zone> zones = array.from(oldest, current)
+    levels.Pivot point = levels.Pivot.new(102, 2, 1, 3)
+    f_assert(f_zoneMatch(zones, point) == 1, "Current range has priority over restoration")
+    f_assert(f_zoneMatch(zones, levels.Pivot.new(104, 2, 1, 3)) == 0, "The oldest current match wins")
+    f_assert(f_zoneMatch(zones, levels.Pivot.new(100, 2, 1, 3)) == 0, "The oldest original match wins")
+    f_assert(f_zoneMatch(zones, levels.Pivot.new(104, 2, -1, 3)) == -1, "Opposite sides do not match")
+    f_zoneAttach(oldest, point)
+    f_assert(oldest.lower == 102 and oldest.upper == 105 and array.size(oldest.pivots) == 1, "Pivot restores only the trimmed edge")
+    true
+
+f_latePivotTests() =>
+    Zone zone = f_testZone()
+    f_zoneBar(zone, f_testCandle(0, 99, 101, 99, 99))
+    f_zoneBar(zone, f_testCandle(1, 97, 99, 98, 99))
+    f_zoneBar(zone, f_testCandle(3, 99, 101, 99, 99))
+    levels.Pivot outside = levels.Pivot.new(99, 2, 1, 4)
+    f_zoneRebound(zone, outside)
+    Touch first = array.get(zone.touches, 0)
+    Touch active = array.get(zone.touches, 1)
+    f_assert(not na(first.rebound) and first.rebound.knownAt == 4 and first.closedAt == 1, "A late pivot confirms the preceding completed touch")
+    f_assert(na(active.rebound) and na(active.closedAt) and zone.rebounds == 1, "The new active touch stays open")
+    f_zoneRebound(zone, outside)
+    f_assert(zone.rebounds == 1, "Repeated rebound input does not count twice")
+    f_zoneAttach(zone, levels.Pivot.new(100, 0, 1, 4))
+    f_assert(array.size(first.pivots) == 1 and na(first.closedAt) == false, "Late membership does not reopen a completed touch")
+    true
+
+f_reboundEdgeTests() =>
+    Zone zone = f_testZone()
+    f_zoneBar(zone, f_testCandle(0, 99, 101, 99, 99))
+    f_zoneBar(zone, f_testCandle(1, 97, 99, 98, 99))
+    zone.lower := 103
+    f_zoneRebound(zone, levels.Pivot.new(102, 2, 1, 3))
+    f_zoneRebound(zone, levels.Pivot.new(99, 2, -1, 3))
+    f_assert(zone.rebounds == 0, "Restoring and opposite pivots do not confirm a rebound")
+    Zone support = f_testZone(-1)
+    f_zoneBar(support, f_testCandle(0, 104, 106, 106, 106))
+    f_zoneBar(support, f_testCandle(1, 106, 108, 106, 107))
+    f_zoneRebound(support, levels.Pivot.new(106, 2, -1, 3))
+    f_assert(support.rebounds == 1, "A low above support confirms its rebound")
+    true
+
+f_seedTests() =>
+    levels.Pivot point = levels.Pivot.new(100, 0, 1, 2)
+    array<Candle> recent = array.from(f_testCandle(0, 98, 100, 98, 99), f_testCandle(1, 96, 98, 96, 97), f_testCandle(2, 98, 100, 98, 99))
+    Zone seed = f_zoneSeed(point, 2, 0.5, recent)
+    f_assert(not na(seed) and seed.initialLower == 99 and seed.initialUpper == 101 and seed.createdAt == 2, "Seed uses the source ATR and confirmation time")
+    f_assert(seed.completed == 1 and array.size(seed.touches) == 1 and array.size(array.get(seed.touches, 0).pivots) == 1, "Replay ends the first touch and attaches its pivot")
+    f_zoneBar(seed, array.get(recent, 2))
+    f_assert(array.size(seed.touches) == 2, "The confirmation candle is processed once")
+    f_assert(na(f_zoneSeed(point, na, 0.5, recent)) and na(f_zoneSeed(point, 0, 0.5, recent)) and na(f_zoneSeed(point, -1, 0.5, recent)), "Missing and nonpositive ATR cannot seed")
+    f_assert(na(f_zoneSeed(point, 2, 0, recent)) and na(f_zoneSeed(point, 2, -1, recent)), "Nonpositive width cannot seed")
+    array<Candle> broken = array.from(f_testCandle(0, 98, 100, 98, 98), f_testCandle(1, 98, 102, 98, 102))
+    f_assert(na(f_zoneSeed(point, 2, 0.5, broken)), "A historically consumed seed is not revived")
+    true
+
+f_stepTests() =>
+    array<Zone> zones = array.from(f_testZone())
+    array<Candle> recent = array.new<Candle>()
+    array<levels.Pivot> empty = array.new<levels.Pivot>()
+    Candle candle = f_testCandle(0, 99, 101, 99, 99)
+    f_assert(not f_zoneStep(zones, recent, candle, empty, 2, 0.5, 1, 50, 2, false), "An open candle is not processed")
+    f_assert(array.size(recent) == 0 and array.size(array.get(zones, 0).touches) == 0, "Open input leaves state unchanged")
+    f_assert(f_zoneStep(zones, recent, candle, empty, 2, 0.5, 1, 50, 2, true), "A closed candle is processed")
+    f_assert(not f_zoneStep(zones, recent, candle, empty, 2, 0.5, 1, 50, 2, true), "A repeated closure is ignored")
+    f_assert(array.size(array.get(array.get(zones, 0).touches, 0).candles) == 1, "Duplicate input does not add a candle")
+    f_zoneStep(zones, recent, f_testCandle(1, 99, 106, 99, 106), empty, 2, 0.5, 1, 50, 2, true)
+    f_assert(array.size(zones) == 0, "A body crossing the range removes the zone")
+    true
+
+f_broadcastTests() =>
+    Zone resistance = f_testZone()
+    f_zoneBar(resistance, f_testCandle(0, 99, 101, 99, 99))
+    f_zoneBar(resistance, f_testCandle(1, 96, 98, 96, 97))
+    levels.Pivot point = levels.Pivot.new(99, 2, 1, 3)
+    array<Zone> zones = array.from(resistance)
+    array<Candle> recent = array.from(f_testCandle(2, 97, 99, 97, 97))
+    f_zoneStep(zones, recent, f_testCandle(3, 96, 98, 96, 96), array.from(point), 1, 0.5, 1, 50, 2, true)
+    f_assert(array.size(zones) == 2 and resistance.rebounds == 1, "A new seed also confirms a rebound from another zone")
+    f_assert(array.get(zones, 1).sourceIndex == 2 and resistance.completed == 1, "Broadcast does not invent another touch")
+    true
+
+f_pruneTests() =>
+    Zone first = f_testZone()
+    Zone second = f_testZone(-1)
+    second.sourceIndex := 10
+    Zone third = f_testZone()
+    third.sourceIndex := 20
+    array<Zone> zones = array.from(first, second, third)
+    f_zonePrune(zones, 10, 2)
+    f_assert(array.size(zones) == 2 and array.get(zones, 0).sourceIndex == 10, "Lifetime keeps the inclusive boundary")
+    f_zonePrune(zones, 10, 1)
+    f_assert(array.size(zones) == 1 and array.get(zones, 0).sourceIndex == 20, "Capacity keeps the newest zone")
+    f_zonePrune(zones, 21, 1)
+    f_zonePrune(zones, 21, 1)
+    f_assert(array.size(zones) == 0, "Empty and repeated pruning are safe")
+    true
+
+f_newPivotTests() =>
+    array<levels.Pivot> points = array.new<levels.Pivot>()
+    array<levels.Pivot> empty = array.new<levels.Pivot>()
+    array<levels.Pivot> highs = array.from(levels.Pivot.new(110, 0, 1, 1), levels.Pivot.new(120, 2, 1, 3))
+    array<levels.Pivot> lows = array.from(levels.Pivot.new(90, 2, -1, 3))
+
+    f_newPivot(points, empty, 3)
+    f_newPivot(points, highs, 4)
+    f_assert(array.size(points) == 0, "Empty input and old confirmations produce no events")
+    f_newPivot(points, highs, 3)
+    f_newPivot(points, lows, 3)
+    f_assert(array.size(points) == 2, "Both sides of one bar reach the zone calculation")
+    f_assert(array.get(points, 0).price == 120 and array.get(points, 0).knownAt == 3, "New events preserve library metadata")
+    f_assert(array.get(points, 1).side == -1 and array.size(highs) == 2 and array.size(lows) == 1, "Reading events preserves independent source arrays")
+    true
+
+f_replayVisibilityTests() =>
+    array<Candle> recent = array.new<Candle>()
+    for i = 0 to 2
+        array.push(recent, f_testCandle(i * 2, 98, 100, 98, 98))
+        array.push(recent, f_testCandle(i * 2 + 1, 96, 98, 96, 97))
+    Candle confirmation = f_testCandle(6, 96, 98, 96, 97)
+    array<Zone> zones = array.new<Zone>()
+    array<levels.Pivot> points = array.from(levels.Pivot.new(100, 0, 1, 6))
+
+    f_zoneStep(zones, recent, confirmation, points, 2, 0.5, 6, 50, 2, true)
+    f_assert(array.size(zones) == 1, "Replay keeps an unbroken candidate")
+    Zone zone = array.get(zones, 0)
+    f_assert(zone.completed == 3 and f_zoneVisible(zone), "Three replayed touches make the candidate visible")
+    f_assert(zone.visibleTime == confirmation.stamp, "The band cannot start before pivot confirmation")
+    true
+
+f_restoreBeforeBodyTests() =>
+    Zone zone = f_testZone()
+    zone.lower := 103
+    array<Zone> zones = array.from(zone)
+    array<Candle> recent = array.from(f_testCandle(0, 99, 102, 99, 99))
+    array<levels.Pivot> points = array.from(levels.Pivot.new(101, 0, 1, 1))
+
+    f_zoneStep(zones, recent, f_testCandle(1, 100, 104, 100, 102), points, 2, 0.5, 1, 50, 2, true)
+    f_assert(array.size(zones) == 1 and zone.lower == 102 and zone.upper == 105, "Restoration runs before the closing body trims the zone")
+    f_assert(array.size(zone.touches) == 1 and zone.rebounds == 0, "The restored range records a touch without a rebound")
+    true
+
+f_unitTests() =>
+    f_newPivotTests()
+    f_touchTests()
+    f_visibilityTests()
+    f_trimTests()
+    f_bodyEdgeTests()
+    f_matchTests()
+    f_latePivotTests()
+    f_reboundEdgeTests()
+    f_seedTests()
+    f_stepTests()
+    f_broadcastTests()
+    f_pruneTests()
+    f_replayVisibilityTests()
+    f_restoreBeforeBodyTests()
+    log.info("Zones unit tests: PASS")
+    true
+
+float atr = ta.atr(atrPeriod)
+
+var array<levels.Pivot> highPivots = array.new<levels.Pivot>()
+var array<levels.Pivot> lowPivots = array.new<levels.Pivot>()
+
+var array<Zone> zones = array.new<Zone>()
+var array<Candle> recent = array.new<Candle>()
+var array<box> bands = array.new<box>()
+var int lastClosedTime = na
+
+if barstate.isfirst and runTests
+    f_unitTests()
+
+levels.pivot_collectHigh(highPivots, high, pivotSpan, barstate.isconfirmed, bar_index)
+levels.pivot_collectLow(lowPivots, low, pivotSpan, barstate.isconfirmed, bar_index)
+
+if barstate.isconfirmed
+    int firstIndex = bar_index - historyBars + 1
+    levels.pivot_pruneWindow(highPivots, firstIndex)
+    levels.pivot_pruneWindow(lowPivots, firstIndex)
+
+    array<levels.Pivot> points = array.new<levels.Pivot>()
+    f_newPivot(points, highPivots, bar_index)
+    f_newPivot(points, lowPivots, bar_index)
+    int closedTime = na(time_close) ? time : time_close
+    Candle candle = Candle.new(bar_index, closedTime, open, high, low, close)
+    f_zoneStep(zones, recent, candle, points, atr[pivotSpan], widthFactor, pivotSpan, historyBars, zoneLimit, true)
+    lastClosedTime := closedTime
+
+if (barstate.islastconfirmedhistory or barstate.islast) and not na(lastClosedTime)
+    f_draw(bands, zones, lastClosedTime)

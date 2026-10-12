@@ -24,3 +24,4 @@
 - [Pivot: определение и общий контракт](PyScript/docs/library/pivot.md)
 - [Pivot: реализация библиотеки в Pine Script](PyScript/docs/library/pivot-pine.md)
 - [Индикатор экстремумов и уровней](PyScript/docs/pivot-levels.md)
+- [Индикатор зон Zones](PyScript/docs/zone.md)
