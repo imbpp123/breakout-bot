@@ -15,6 +15,8 @@ Keep service behavior and implementation details in the relevant documentation g
 
 Ask only when a missing decision blocks the current task; continue independent work. Document reasonable assumptions. Do not treat examples or open questions as approved requirements.
 
+Не проверять код через браузер без прямого запроса пользователя. Браузерную проверку пользователь выполняет самостоятельно и сообщает об ошибках. Агент выполняет доступные локальные проверки и исправляет код по обратной связи пользователя.
+
 ## Language and communication
 
 - Use simple, clear language. Use level B1 English where English is required.
@@ -96,7 +98,7 @@ Separate calculations from I/O. Keep business rules and validation directly test
 ## Проверка Pine Script
 
 - Модульные тесты для Pine Script не обязательны. Не добавлять тестовые функции, искусственные данные и запуск тестов в рабочие индикаторы, стратегии и библиотеки.
-- Проверять изменения компиляцией в TradingView, на графике и в Replay. Проверять обычные и граничные настройки, подтверждение на закрытой свече и отображение. Если проверка недоступна, явно указать это в отчёте.
+- Компиляцию в TradingView, проверку на графике и в Replay выполняет пользователь. Агент не запускает эти проверки через браузер без прямого запроса пользователя. До получения результатов не считать такую проверку выполненной.
 - Для сложных правил допустим отдельный тестовый скрипт, если он решает конкретную задачу и фактически запускается. По умолчанию его не создавать.
 
 ## Tests: behavior, not call choreography
