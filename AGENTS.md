@@ -93,9 +93,15 @@ Separate calculations from I/O. Keep business rules and validation directly test
 - Главная группировка объявлений библиотеки — по назначению: `Pivot` → `Extreme` → `Zone`. Каждая группа содержит свои структуры и функции целиком; не собирать структуры или функции разных групп в общие блоки. Внутри каждой группы предпочтительный порядок: экспортируемые структуры, приватные структуры, экспортируемые функции, приватные функции. Учитывать зависимости Pine: вызываемая функция должна быть объявлена раньше вызывающей, поэтому необходимые приватные помощники размещаются перед экспортируемыми функциями своей группы. Пустые группы не добавлять.
 - Первый параметр каждой экспортируемой функции — объект или коллекция, над которыми она работает. Например, функции обработки pivot принимают первым параметром `array<Pivot> pivots`. Остальные данные и настройки идут после него.
 
+## Проверка Pine Script
+
+- Модульные тесты для Pine Script не обязательны. Не добавлять тестовые функции, искусственные данные и запуск тестов в рабочие индикаторы, стратегии и библиотеки.
+- Проверять изменения компиляцией в TradingView, на графике и в Replay. Проверять обычные и граничные настройки, подтверждение на закрытой свече и отображение. Если проверка недоступна, явно указать это в отчёте.
+- Для сложных правил допустим отдельный тестовый скрипт, если он решает конкретную задачу и фактически запускается. По умолчанию его не создавать.
+
 ## Tests: behavior, not call choreography
 
-Unit tests are required for every non-trivial logic change. Bug fixes need a regression test that demonstrates the failure. Test observable inputs, outputs, state changes, invariants, and errors.
+Этот раздел относится к коду вне Pine Script. Модульные тесты обязательны для каждого нетривиального изменения логики. Исправление ошибки требует регрессионного теста, который показывает сбой. Проверять наблюдаемые входы, выходы, изменения состояния, инварианты и ошибки.
 
 - Keep tests simple and easy to read. Repeated code in tests is acceptable; prefer clear, self-contained scenarios over abstractions added only to remove duplication. Keep helpers small and explicit, and avoid generic test frameworks or reflection that hide setup, actions, or expected results.
 - Use table-driven tests when cases share the same setup, action, and assertion structure. Define named test cases first, then use one shared execution loop with `t.Run`. Each subtest must create its own state from its case data.
