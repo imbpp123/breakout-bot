@@ -45,10 +45,35 @@ f_pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool c
     float price = f_pivot_price(source, span, -1)
     f_pivot_append(lowPivots, price, span, -1, confirmed, index)
 
+f_level_isCovered(float price, float candleLow, float candleHigh) =>
+    not na(candleLow) and not na(candleHigh) and int(math.sign(price - candleLow)) >= 0 and int(math.sign(candleHigh - price)) >= 0
+
+f_level_update(array<Pivot> activeLevels, array<Pivot> pivots, float candleLow, float candleHigh, simple int span, bool confirmed, int index) =>
+    int count = array.size(activeLevels)
+    if count > 0
+        for step = 0 to count - 1
+            int i = count - 1 - step
+            Pivot point = array.get(activeLevels, i)
+            if f_level_isCovered(point.price, candleLow, candleHigh)
+                array.remove(activeLevels, i)
+
+    if confirmed and array.size(pivots) > 0
+        Pivot point = array.get(pivots, array.size(pivots) - 1)
+        if point.knownAt == index
+            bool covered = false
+            // Check later candles in the confirmation window, but not the pivot candle.
+            for offset = 0 to span - 1
+                if f_level_isCovered(point.price, candleLow[offset], candleHigh[offset])
+                    covered := true
+                    break
+            if not covered
+                array.push(activeLevels, point)
+
 int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
 bool showHighPivots = input.bool(true, "Show high pivots")
 bool showLowPivots = input.bool(true, "Show low pivots")
+bool filterCoveredLevels = input.bool(false, "Hide covered pivot levels", tooltip = "Hide a level after any later candle touches its price, including wicks and the current open candle. Pivot markers stay visible.")
 color highLevelColor = input.color(color.red, "High pivot level color")
 color lowLevelColor = input.color(color.teal, "Low pivot level color")
 
@@ -62,11 +87,20 @@ f_markerValue(array<Pivot> pivots, int currentIndex, bool confirmed, bool visibl
 
 var array<Pivot> highPivots = array.new<Pivot>()
 var array<Pivot> lowPivots = array.new<Pivot>()
+var array<Pivot> activeHighLevels = array.new<Pivot>()
+var array<Pivot> activeLowLevels = array.new<Pivot>()
 f_pivot_collectHigh(highPivots, high, pivotSpan, barstate.isconfirmed, bar_index)
 f_pivot_collectLow(lowPivots, low, pivotSpan, barstate.isconfirmed, bar_index)
 if barstate.isconfirmed
     f_pivot_pruneWindow(highPivots, bar_index - historyBars + 1)
     f_pivot_pruneWindow(lowPivots, bar_index - historyBars + 1)
+
+if filterCoveredLevels
+    if barstate.isconfirmed
+        f_pivot_pruneWindow(activeHighLevels, bar_index - historyBars + 1)
+        f_pivot_pruneWindow(activeLowLevels, bar_index - historyBars + 1)
+    f_level_update(activeHighLevels, highPivots, low, high, pivotSpan, barstate.isconfirmed, bar_index)
+    f_level_update(activeLowLevels, lowPivots, low, high, pivotSpan, barstate.isconfirmed, bar_index)
 
 float highMarker = f_markerValue(highPivots, bar_index, barstate.isconfirmed, showHighPivots)
 float lowMarker = f_markerValue(lowPivots, bar_index, barstate.isconfirmed, showLowPivots)
@@ -88,13 +122,15 @@ if barstate.islastconfirmedhistory or barstate.islast
         line.delete(drawing)
     array.clear(drawnLevels)
 
-    int highIndex = showHighPivots ? array.size(highPivots) - 1 : -1
-    int lowIndex = showLowPivots ? array.size(lowPivots) - 1 : -1
+    array<Pivot> highLevels = filterCoveredLevels ? activeHighLevels : highPivots
+    array<Pivot> lowLevels = filterCoveredLevels ? activeLowLevels : lowPivots
+    int highIndex = showHighPivots ? array.size(highLevels) - 1 : -1
+    int lowIndex = showLowPivots ? array.size(lowLevels) - 1 : -1
 
     // Keep the latest visible levels within Pine's shared limit for both sides.
     while array.size(drawnLevels) < 500 and (highIndex >= 0 or lowIndex >= 0)
-        bool isHigh = lowIndex < 0 or (highIndex >= 0 and array.get(highPivots, highIndex).index >= array.get(lowPivots, lowIndex).index)
-        Pivot point = isHigh ? array.get(highPivots, highIndex) : array.get(lowPivots, lowIndex)
+        bool isHigh = lowIndex < 0 or (highIndex >= 0 and array.get(highLevels, highIndex).index >= array.get(lowLevels, lowIndex).index)
+        Pivot point = isHigh ? array.get(highLevels, highIndex) : array.get(lowLevels, lowIndex)
         color levelColor = isHigh ? highLevelColor : lowLevelColor
         array.push(drawnLevels, line.new(point.index, point.price, bar_index, point.price, extend = extend.none, color = levelColor, style = line.style_arrow_right))
 
