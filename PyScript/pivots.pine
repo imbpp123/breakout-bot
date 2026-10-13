@@ -77,6 +77,11 @@ f_natr_isAcceptable(bool previous, float value, float disableThreshold, float en
         acceptable := true
     acceptable
 
+f_supertrend_closed(simple float factor, simple int period) =>
+    [value, direction] = ta.supertrend(factor, period)
+    // The offset keeps higher-timeframe values fixed during the open source bar.
+    [value[1], direction[1]]
+
 int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
 bool showHighPivots = input.bool(true, "Show high pivots")
@@ -90,8 +95,19 @@ int natrPeriod = input.int(14, "NATR period", minval = 1, maxval = 5000, group =
 float natrDisableThreshold = input.float(1.1, "NATR disable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Block entries when NATR closes at or below this value.")
 float natrEnableThreshold = input.float(1.2, "NATR enable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Allow entries when NATR closes at or above this value. Must be above the disable threshold.")
 
+string trendGroup = "Global trend"
+string trendTimeframe = input.timeframe("1D", "Trend timeframe", group = trendGroup, tooltip = "Use the last closed Supertrend bar. The timeframe must be equal to or higher than the chart timeframe.")
+int trendAtrPeriod = input.int(10, "Supertrend ATR period", minval = 1, maxval = 5000, group = trendGroup)
+float trendFactor = input.float(3.0, "Supertrend multiplier", minval = 0.01, step = 0.1, group = trendGroup)
+
+string selectedTrendTimeframe = trendTimeframe == "" ? timeframe.period : trendTimeframe
+bool trendOnChart = timeframe.in_seconds(selectedTrendTimeframe) == timeframe.in_seconds()
+
 if natrEnableThreshold <= natrDisableThreshold
     runtime.error("NATR enable threshold must be above the disable threshold.")
+
+if timeframe.in_seconds(selectedTrendTimeframe) < timeframe.in_seconds()
+    runtime.error("Trend timeframe must be equal to or higher than the chart timeframe.")
 
 f_markerValue(array<Pivot> pivots, int currentIndex, bool confirmed, bool visible) =>
     float price = na
@@ -110,21 +126,44 @@ if barstate.isconfirmed
     closedNatr := natrValue
     natrAcceptable := f_natr_isAcceptable(natrAcceptable, closedNatr, natrDisableThreshold, natrEnableThreshold)
 
-bool entriesAllowed = natrAcceptable
+[chartTrendValue, chartTrendDirection] = ta.supertrend(trendFactor, trendAtrPeriod)
+var float closedTrendValue = na
+var float closedTrendDirection = na
+
+if trendOnChart
+    if barstate.isconfirmed
+        closedTrendValue := chartTrendValue
+        closedTrendDirection := chartTrendDirection
+else
+    [higherTrendValue, higherTrendDirection] = request.security(syminfo.tickerid, selectedTrendTimeframe, f_supertrend_closed(trendFactor, trendAtrPeriod), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+    closedTrendValue := higherTrendValue
+    closedTrendDirection := higherTrendDirection
+
+bool trendReady = not na(closedTrendValue) and not na(closedTrendDirection)
+// ta.supertrend uses negative direction for an uptrend.
+bool trendAcceptable = trendReady and closedTrendDirection < 0
+bool entriesAllowed = natrAcceptable and trendAcceptable
 color entryColor = entriesAllowed ? color.green : color.red
 bgcolor(color.new(entryColor, 90), title = "Entry permission")
 
-var table entryConditions = table.new(position.top_right, 3, 2, bgcolor = chart.bg_color, frame_color = color.new(chart.fg_color, 70), frame_width = 1)
+var table entryConditions = table.new(position.top_right, 3, 3, bgcolor = chart.bg_color, frame_color = color.new(chart.fg_color, 70), frame_width = 1)
 
 if barstate.islast
     string natrText = na(closedNatr) ? "N/A" : str.tostring(closedNatr, "0.000") + "%"
     string natrStatus = na(closedNatr) ? "Blocked: no data" : natrAcceptable ? "Acceptable" : "Blocked"
+    string trendText = not trendReady ? "N/A" : trendAcceptable ? "UP" : "DOWN"
+    string trendStatus = not trendReady ? "Blocked: no data" : trendAcceptable ? "Acceptable" : "Blocked"
+    color natrColor = natrAcceptable ? color.green : color.red
+    color trendColor = trendAcceptable ? color.green : color.red
     table.cell(entryConditions, 0, 0, "Entry condition", text_color = chart.fg_color, text_size = size.small)
     table.cell(entryConditions, 1, 0, "Value", text_color = chart.fg_color, text_size = size.small)
     table.cell(entryConditions, 2, 0, "Status", text_color = chart.fg_color, text_size = size.small)
     table.cell(entryConditions, 0, 1, "NATR", text_color = chart.fg_color, text_size = size.small)
     table.cell(entryConditions, 1, 1, natrText, text_color = chart.fg_color, text_size = size.small)
-    table.cell(entryConditions, 2, 1, natrStatus, text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(entryColor, 80))
+    table.cell(entryConditions, 2, 1, natrStatus, text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(natrColor, 80))
+    table.cell(entryConditions, 0, 2, "Supertrend (" + selectedTrendTimeframe + ")", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 1, 2, trendText, text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(trendColor, 80))
+    table.cell(entryConditions, 2, 2, trendStatus, text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(trendColor, 80))
 
 var array<Pivot> highPivots = array.new<Pivot>()
 var array<Pivot> lowPivots = array.new<Pivot>()
