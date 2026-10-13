@@ -69,6 +69,14 @@ f_level_update(array<Pivot> activeLevels, array<Pivot> pivots, float candleLow, 
             if not covered
                 array.push(activeLevels, point)
 
+f_natr_isAcceptable(bool previous, float value, float disableThreshold, float enableThreshold) =>
+    bool acceptable = previous
+    if na(value) or value <= disableThreshold
+        acceptable := false
+    else if value >= enableThreshold
+        acceptable := true
+    acceptable
+
 int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
 bool showHighPivots = input.bool(true, "Show high pivots")
@@ -77,6 +85,14 @@ bool filterCoveredLevels = input.bool(false, "Hide covered pivot levels", toolti
 color highLevelColor = input.color(color.red, "High pivot level color")
 color lowLevelColor = input.color(color.teal, "Low pivot level color")
 
+string entryGroup = "Entry conditions"
+int natrPeriod = input.int(14, "NATR period", minval = 1, maxval = 5000, group = entryGroup)
+float natrDisableThreshold = input.float(1.1, "NATR disable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Block entries when NATR closes at or below this value.")
+float natrEnableThreshold = input.float(1.2, "NATR enable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Allow entries when NATR closes at or above this value. Must be above the disable threshold.")
+
+if natrEnableThreshold <= natrDisableThreshold
+    runtime.error("NATR enable threshold must be above the disable threshold.")
+
 f_markerValue(array<Pivot> pivots, int currentIndex, bool confirmed, bool visible) =>
     float price = na
     if confirmed and visible and array.size(pivots) > 0
@@ -84,6 +100,31 @@ f_markerValue(array<Pivot> pivots, int currentIndex, bool confirmed, bool visibl
         if point.knownAt == currentIndex
             price := point.price
     price
+
+float natrAtr = ta.atr(natrPeriod)
+float natrValue = not na(close) and close > 0 ? 100 * natrAtr / close : na
+var float closedNatr = na
+var bool natrAcceptable = false
+
+if barstate.isconfirmed
+    closedNatr := natrValue
+    natrAcceptable := f_natr_isAcceptable(natrAcceptable, closedNatr, natrDisableThreshold, natrEnableThreshold)
+
+bool entriesAllowed = natrAcceptable
+color entryColor = entriesAllowed ? color.green : color.red
+bgcolor(color.new(entryColor, 90), title = "Entry permission")
+
+var table entryConditions = table.new(position.top_right, 3, 2, bgcolor = chart.bg_color, frame_color = color.new(chart.fg_color, 70), frame_width = 1)
+
+if barstate.islast
+    string natrText = na(closedNatr) ? "N/A" : str.tostring(closedNatr, "0.000") + "%"
+    string natrStatus = na(closedNatr) ? "Blocked: no data" : natrAcceptable ? "Acceptable" : "Blocked"
+    table.cell(entryConditions, 0, 0, "Entry condition", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 1, 0, "Value", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 2, 0, "Status", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 0, 1, "NATR", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 1, 1, natrText, text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 2, 1, natrStatus, text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(entryColor, 80))
 
 var array<Pivot> highPivots = array.new<Pivot>()
 var array<Pivot> lowPivots = array.new<Pivot>()
