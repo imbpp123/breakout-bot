@@ -81,7 +81,7 @@ int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
 bool showHighPivots = input.bool(true, "Show high pivots")
 bool showLowPivots = input.bool(true, "Show low pivots")
-bool filterCoveredLevels = input.bool(false, "Hide covered pivot levels", tooltip = "Hide a level after any later candle touches its price, including wicks and the current open candle. Pivot markers stay visible.")
+bool filterCoveredLevels = input.bool(true, "Hide covered pivot levels", tooltip = "Hide a level after any later candle touches its price, including wicks and the current open candle. Pivot markers stay visible.")
 color highLevelColor = input.color(color.red, "High pivot level color")
 color lowLevelColor = input.color(color.teal, "Low pivot level color")
 
