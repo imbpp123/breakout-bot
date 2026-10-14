@@ -112,11 +112,21 @@ f_pivot_scoreNearby(array<Pivot> pivots, array<Pivot> levels, float factor) =>
 
     f_pivot_scoreTotal(levels)
 
-f_pivot_tooltip(Pivot point) =>
-    string sideText = point.side == 1 ? "High" : "Low"
-    string atrText = na(point.atr) ? "N/A" : str.tostring(point.atr, "0.##########")
-    string natrText = na(point.natr) ? "N/A" : str.tostring(point.natr, "0.000") + "%"
-    "Pivot: " + sideText + "\nPrice: " + str.tostring(point.price, format.mintick) + "\nATR: " + atrText + "\nNATR: " + natrText + "\nNearby pivots: " + str.tostring(point.nearbyScore) + "\nProximity score: " + str.tostring(point.proximityScore, "0.000") + "\nTotal score: " + str.tostring(point.totalScore, "0.000")
+f_pivot_tooltipNumber(float value) =>
+    na(value) ? "N/A" : str.tostring(value, "0.########")
+
+f_pivot_searchTooltip(Pivot point, float factor) =>
+    bool atrReady = not na(point.atr) and int(math.sign(point.atr)) > 0
+    float radius = atrReady ? factor * point.atr : na
+    "NEIGHBOR SEARCH\nOwn max distance: " + f_pivot_tooltipNumber(radius) + "\nLower bound: " + f_pivot_tooltipNumber(point.price - radius) + "\nUpper bound: " + f_pivot_tooltipNumber(point.price + radius)
+
+f_pivot_scoresTooltip(Pivot point, float minimumScore) =>
+    "SCORE\nNearby pivots: " + str.tostring(point.nearbyScore) + "\nProximity score: " + f_pivot_tooltipNumber(point.proximityScore) + "\nTotal score: " + f_pivot_tooltipNumber(point.totalScore) + "\nMinimum line score: " + f_pivot_tooltipNumber(minimumScore)
+
+f_pivot_tooltip(Pivot point, float factor, float minimumScore) =>
+    string natrText = na(point.natr) ? "N/A" : f_pivot_tooltipNumber(point.natr) + "%"
+    string details = "Price: " + f_pivot_tooltipNumber(point.price) + "\nATR: " + f_pivot_tooltipNumber(point.atr) + "\nNATR: " + natrText
+    details + "\n\n" + f_pivot_searchTooltip(point, factor) + "\n\n" + f_pivot_scoresTooltip(point, minimumScore)
 
 f_level_isCovered(float price, float candleLow, float candleHigh) =>
     not na(candleLow) and not na(candleHigh) and int(math.sign(price - candleLow)) >= 0 and int(math.sign(candleHigh - price)) >= 0
@@ -164,7 +174,8 @@ color highLevelColor = input.color(color.red, "High pivot level color")
 color lowLevelColor = input.color(color.teal, "Low pivot level color")
 
 string scoreGroup = "Pivot score"
-float nearbyAtrFactor = input.float(0.2, "Nearby pivot distance, ATR", minval = 0.0, step = 0.05, group = scoreGroup, tooltip = "Each nearby pivot of the same side adds 1 point plus a proximity bonus from 0 to 1. Distance must be at most this factor times the smaller pivot ATR. Equal prices get the full bonus, including when this factor is zero. Scores use levels kept by the covered-level filter.")
+float nearbyAtrFactor = input.float(0.4, "Nearby pivot distance, ATR", minval = 0.0, step = 0.05, group = scoreGroup, tooltip = "Each nearby pivot of the same side adds 1 point plus a proximity bonus from 0 to 1. Distance must be at most this factor times the smaller pivot ATR. Equal prices get the full bonus, including when this factor is zero. Scores use levels kept by the covered-level filter.")
+float minimumTotalScore = input.float(1.0, "Minimum total score for lines", minval = 0.0, step = 0.1, group = scoreGroup, tooltip = "Show pivot lines only when their total score is at least this value. Pivot markers and tooltips stay visible. This filter does not change neighbor scores.")
 
 string entryGroup = "Entry conditions"
 int natrPeriod = input.int(14, "NATR period", minval = 1, maxval = 5000, group = entryGroup)
@@ -295,8 +306,9 @@ if barstate.islastconfirmedhistory or barstate.islast
     while array.size(drawnLevels) < 500 and (highIndex >= 0 or lowIndex >= 0)
         bool isHigh = lowIndex < 0 or (highIndex >= 0 and array.get(highLevels, highIndex).index >= array.get(lowLevels, lowIndex).index)
         Pivot point = isHigh ? array.get(highLevels, highIndex) : array.get(lowLevels, lowIndex)
-        color levelColor = isHigh ? highLevelColor : lowLevelColor
-        array.push(drawnLevels, line.new(point.index, point.price, bar_index, point.price, extend = extend.none, color = levelColor, style = line.style_arrow_right))
+        if point.totalScore >= minimumTotalScore
+            color levelColor = isHigh ? highLevelColor : lowLevelColor
+            array.push(drawnLevels, line.new(point.index, point.price, bar_index, point.price, extend = extend.none, color = levelColor, style = line.style_arrow_right))
 
         if isHigh
             highIndex -= 1
@@ -311,7 +323,7 @@ if barstate.islastconfirmedhistory or barstate.islast
         bool isHigh = lowPivotIndex < 0 or (highPivotIndex >= 0 and array.get(highPivots, highPivotIndex).index >= array.get(lowPivots, lowPivotIndex).index)
         Pivot point = isHigh ? array.get(highPivots, highPivotIndex) : array.get(lowPivots, lowPivotIndex)
         color markerColor = isHigh ? color.red : color.teal
-        array.push(drawnPivotDetails, label.new(point.index, point.price, text = "", xloc = xloc.bar_index, yloc = yloc.price, color = markerColor, style = label.style_diamond, size = size.tiny, tooltip = f_pivot_tooltip(point)))
+        array.push(drawnPivotDetails, label.new(point.index, point.price, text = "", xloc = xloc.bar_index, yloc = yloc.price, color = markerColor, style = label.style_diamond, size = size.tiny, tooltip = f_pivot_tooltip(point, nearbyAtrFactor, minimumTotalScore)))
 
         if isHigh
             highPivotIndex -= 1
