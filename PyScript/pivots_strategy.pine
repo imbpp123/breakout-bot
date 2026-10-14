@@ -1,0 +1,431 @@
+//@version=6
+strategy("Pivots strategy", overlay = true, initial_capital = 10000, pyramiding = 0, margin_long = 100, commission_type = strategy.commission.percent, commission_value = 0.06, calc_on_every_tick = false, calc_on_order_fills = true, process_orders_on_close = false, max_bars_back = 5000, max_lines_count = 500, max_labels_count = 500)
+
+// side: -1 = low, 1 = high. knownAt is the pivot confirmation bar.
+type Pivot
+    float price
+    int index
+    int side
+    int knownAt
+    float atr
+    float natr
+    int nearbyScore = 0
+    float proximityScore = 0.0
+    float totalScore = 0.0
+
+type PivotNeighbor
+    Pivot point
+    float distanceAtr
+
+f_pivot_append(array<Pivot> pivots, float price, int span, int side, bool confirmed, int index, float atr, float natr) =>
+    if confirmed and not na(price)
+        array.push(pivots, Pivot.new(price, index - span, side, index, atr, natr))
+
+f_pivot_price(float source, simple int span, simple int side) =>
+    float candidate = source[span]
+    bool valid = not na(candidate)
+    bool hasStrictNeighbor = false
+    if valid
+        for offset = 0 to span * 2
+            float neighbor = source[offset]
+            if na(neighbor)
+                valid := false
+                break
+            // Float comparisons in Pine round operands to nine decimal places.
+            int order = int(math.sign(candidate - neighbor)) * side
+            if order < 0
+                valid := false
+                break
+            if order > 0
+                hasStrictNeighbor := true
+    valid and hasStrictNeighbor ? candidate : na
+
+f_pivot_pruneWindow(array<Pivot> pivots, int firstIndex) =>
+    while array.size(pivots) > 0
+        if array.get(pivots, 0).index >= firstIndex
+            break
+        array.shift(pivots)
+
+f_pivot_collectHigh(array<Pivot> highPivots, float source, simple int span, bool confirmed, int index, float atr, float natr) =>
+    float price = f_pivot_price(source, span, 1)
+    f_pivot_append(highPivots, price, span, 1, confirmed, index, atr[span], natr[span])
+
+f_pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool confirmed, int index, float atr, float natr) =>
+    float price = f_pivot_price(source, span, -1)
+    f_pivot_append(lowPivots, price, span, -1, confirmed, index, atr[span], natr[span])
+
+f_pivot_findNeighbors(Pivot point, array<Pivot> levels, array<int> sortedIndices, int sortedPosition, float factor) =>
+    array<PivotNeighbor> neighbors = array.new<PivotNeighbor>()
+    // Return only later sorted entries so each pair is checked once.
+    if not na(point.atr) and int(math.sign(point.atr)) > 0 and sortedPosition + 1 < array.size(sortedIndices)
+        for j = sortedPosition + 1 to array.size(sortedIndices) - 1
+            Pivot neighbor = array.get(levels, array.get(sortedIndices, j))
+            float distance = math.abs(point.price - neighbor.price)
+            // Compare ATR ratios so Pine's float rounding does not depend on price scale.
+            if distance / point.atr > factor
+                break
+            if not na(neighbor.atr) and int(math.sign(neighbor.atr)) > 0
+                float pairAtr = math.min(point.atr, neighbor.atr)
+                float distanceAtr = distance / pairAtr
+                if distanceAtr <= factor and (factor > 0 or int(math.sign(distance)) == 0)
+                    array.push(neighbors, PivotNeighbor.new(neighbor, distanceAtr))
+    neighbors
+
+f_pivot_scoreCount(Pivot point, array<PivotNeighbor> neighbors) =>
+    point.nearbyScore += array.size(neighbors)
+    for neighbor in neighbors
+        Pivot other = neighbor.point
+        other.nearbyScore += 1
+
+f_pivot_scoreProximity(Pivot point, array<PivotNeighbor> neighbors, float factor) =>
+    for neighbor in neighbors
+        float distanceAtr = neighbor.distanceAtr
+        // A zero factor accepts equal prices and gives the full bonus.
+        float proximityBonus = factor > 0 ? math.max(0.0, 1.0 - distanceAtr / factor) : 1.0
+        Pivot other = neighbor.point
+        point.proximityScore += proximityBonus
+        other.proximityScore += proximityBonus
+
+f_pivot_scoreTotal(array<Pivot> levels) =>
+    for point in levels
+        point.totalScore := point.nearbyScore + point.proximityScore
+
+f_pivot_scoreNearby(array<Pivot> pivots, array<Pivot> levels, float factor) =>
+    // Scores use current levels, not a snapshot from the confirmation bar.
+    for point in pivots
+        point.nearbyScore := 0
+        point.proximityScore := 0.0
+        point.totalScore := 0.0
+
+    int count = array.size(levels)
+    if count > 1
+        array<float> prices = array.new<float>()
+        for point in levels
+            array.push(prices, point.price)
+        array<int> sortedIndices = array.sort_indices(prices, order.ascending)
+
+        for i = 0 to count - 2
+            Pivot point = array.get(levels, array.get(sortedIndices, i))
+            array<PivotNeighbor> neighbors = f_pivot_findNeighbors(point, levels, sortedIndices, i, factor)
+            f_pivot_scoreCount(point, neighbors)
+            f_pivot_scoreProximity(point, neighbors, factor)
+
+    f_pivot_scoreTotal(levels)
+
+f_pivot_tooltipNumber(float value) =>
+    na(value) ? "N/A" : str.tostring(value, "0.########")
+
+f_pivot_searchTooltip(Pivot point, float factor) =>
+    bool atrReady = not na(point.atr) and int(math.sign(point.atr)) > 0
+    float radius = atrReady ? factor * point.atr : na
+    "NEIGHBOR SEARCH\nOwn max distance: " + f_pivot_tooltipNumber(radius) + "\nLower bound: " + f_pivot_tooltipNumber(point.price - radius) + "\nUpper bound: " + f_pivot_tooltipNumber(point.price + radius)
+
+f_pivot_scoresTooltip(Pivot point, float minimumScore) =>
+    "SCORE\nNearby pivots: " + str.tostring(point.nearbyScore) + "\nProximity score: " + f_pivot_tooltipNumber(point.proximityScore) + "\nTotal score: " + f_pivot_tooltipNumber(point.totalScore) + "\nMinimum line score: " + f_pivot_tooltipNumber(minimumScore)
+
+f_pivot_tooltip(Pivot point, float factor, float minimumScore) =>
+    string natrText = na(point.natr) ? "N/A" : f_pivot_tooltipNumber(point.natr) + "%"
+    string details = "Price: " + f_pivot_tooltipNumber(point.price) + "\nATR: " + f_pivot_tooltipNumber(point.atr) + "\nNATR: " + natrText
+    details + "\n\n" + f_pivot_searchTooltip(point, factor) + "\n\n" + f_pivot_scoresTooltip(point, minimumScore)
+
+f_level_isCovered(Pivot point, float candleLow, float candleHigh) =>
+    bool covered = false
+    if not na(candleLow) and not na(candleHigh)
+        int lowOrder = int(math.sign(point.price - candleLow))
+        int highOrder = int(math.sign(candleHigh - point.price))
+        // Equal highs or lows can form another pivot at the same level.
+        covered := point.side == 1 ? lowOrder >= 0 and highOrder > 0 : lowOrder > 0 and highOrder >= 0
+    covered
+
+f_level_update(array<Pivot> activeLevels, array<Pivot> pivots, float candleLow, float candleHigh, simple int span, bool confirmed, int index) =>
+    int count = array.size(activeLevels)
+    if count > 0
+        for step = 0 to count - 1
+            int i = count - 1 - step
+            Pivot point = array.get(activeLevels, i)
+            if f_level_isCovered(point, candleLow, candleHigh)
+                array.remove(activeLevels, i)
+
+    if confirmed and array.size(pivots) > 0
+        Pivot point = array.get(pivots, array.size(pivots) - 1)
+        if point.knownAt == index
+            bool covered = false
+            // Check later candles in the confirmation window, but not the pivot candle.
+            for offset = 0 to span - 1
+                if f_level_isCovered(point, candleLow[offset], candleHigh[offset])
+                    covered := true
+                    break
+            if not covered
+                array.push(activeLevels, point)
+
+f_natr_isAcceptable(bool previous, float value, float disableThreshold, float enableThreshold) =>
+    bool acceptable = previous
+    if na(value) or value <= disableThreshold
+        acceptable := false
+    else if value >= enableThreshold
+        acceptable := true
+    acceptable
+
+f_supertrend_closed(simple float factor, simple int period) =>
+    [value, direction] = ta.supertrend(factor, period)
+    // The offset keeps higher-timeframe values fixed during the open source bar.
+    [value[1], direction[1]]
+
+f_entry_level(array<Pivot> levels, float price, float minimumScore) =>
+    float selectedPrice = na
+    for point in levels
+        if point.totalScore >= minimumScore and point.price > price
+            if na(selectedPrice) or point.price < selectedPrice
+                selectedPrice := point.price
+    selectedPrice
+
+f_entry_quantity(float capital, float price, float stopPrice, float riskPercent, float commissionPercent, float pointValue, float minimumQuantity) =>
+    float quantity = na
+    if not na(capital) and capital > 0 and price > 0 and stopPrice > 0 and stopPrice < price and riskPercent > 0 and commissionPercent >= 0 and pointValue > 0 and minimumQuantity > 0
+        float commissionRate = commissionPercent / 100.0
+        float riskPerContract = (price - stopPrice + (price + stopPrice) * commissionRate) * pointValue
+        float riskQuantity = capital * riskPercent / 100.0 / riskPerContract
+        // Reserve the entry fee so the position does not require borrowed capital.
+        float cashQuantity = capital / (price * pointValue * (1.0 + commissionRate))
+        quantity := math.floor(math.min(riskQuantity, cashQuantity) / minimumQuantity) * minimumQuantity
+    quantity
+
+f_exit_prices(float entryPrice, float stopPercent, float targetPercent, float tickSize) =>
+    float stopPrice = math.min(math.round(entryPrice * (1.0 - stopPercent / 100.0) / tickSize) * tickSize, entryPrice - tickSize)
+    float targetPrice = math.max(math.round(entryPrice * (1.0 + targetPercent / 100.0) / tickSize) * tickSize, entryPrice + tickSize)
+    [stopPrice, targetPrice]
+
+int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
+int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
+bool showHighPivots = input.bool(true, "Show high pivots")
+bool showLowPivots = input.bool(true, "Show low pivots")
+bool filterCoveredLevels = input.bool(true, "Hide covered pivot levels", tooltip = "Remove a level when a later closed candle covers its price and moves past it: above for highs, below for lows. Equal highs or lows keep the level. Includes wicks. Pivot markers stay visible.")
+color highLevelColor = input.color(color.red, "High pivot level color")
+color lowLevelColor = input.color(color.teal, "Low pivot level color")
+
+string scoreGroup = "Pivot score"
+float nearbyAtrFactor = input.float(0.4, "Nearby pivot distance, ATR", minval = 0.0, step = 0.05, group = scoreGroup, tooltip = "Each nearby pivot of the same side adds 1 point plus a proximity bonus from 0 to 1. Distance must be at most this factor times the smaller pivot ATR. Equal prices get the full bonus, including when this factor is zero. Scores use levels kept by the covered-level filter.")
+float minimumTotalScore = input.float(1.0, "Minimum total score for lines and entries", minval = 0.0, step = 0.1, group = scoreGroup, tooltip = "Show pivot lines and allow entries only when the total score is at least this value. Pivot markers and tooltips stay visible. This filter does not change neighbor scores.")
+
+string entryGroup = "Entry conditions"
+int natrPeriod = input.int(14, "NATR period", minval = 1, maxval = 5000, group = entryGroup)
+float natrDisableThreshold = input.float(1.1, "NATR disable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Block entries when NATR closes at or below this value.")
+float natrEnableThreshold = input.float(1.2, "NATR enable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Allow entries when NATR closes at or above this value. Must be above the disable threshold.")
+
+string trendGroup = "Global trend"
+string trendTimeframe = input.timeframe("1D", "Trend timeframe", group = trendGroup, tooltip = "Use the last closed Supertrend bar. The timeframe must be equal to or higher than the chart timeframe.")
+int trendAtrPeriod = input.int(10, "Supertrend ATR period", minval = 1, maxval = 5000, group = trendGroup)
+float trendFactor = input.float(3.0, "Supertrend multiplier", minval = 0.01, step = 0.1, group = trendGroup)
+
+string tradeGroup = "Backtest orders"
+float riskPercent = input.float(3.0, "Risk per trade, % of equity", minval = 0.01, maxval = 100.0, step = 0.1, group = tradeGroup, tooltip = "Planned loss at the stop, including the risk cost estimates. Position size uses the entry limit price and the rounded stop price. Position value plus the estimated entry fee cannot exceed current equity. A tighter stop can give less risk when the cash limit is reached. Price gaps can exceed the planned risk.")
+float stopPercent = input.float(5.0, "Stop loss, % of entry price", minval = 0.01, maxval = 99.0, step = 0.5, group = tradeGroup)
+float targetPercent = input.float(10.0, "Take profit, % of entry price", minval = 0.01, step = 0.5, group = tradeGroup)
+int entryLimitTicks = input.int(0, "Entry limit above level, ticks", minval = 0, group = tradeGroup, tooltip = "Long stop is at the nearest high level above the close. The buy limit is this many ticks above it. A price gap above the limit can leave the entry unfilled. Entry orders are checked and replaced at each bar close.")
+
+string riskCostsGroup = "Risk cost estimates"
+float riskCommissionPercent = input.float(0.06, "Commission per fill, %", minval = 0.0, step = 0.01, group = riskCostsGroup, tooltip = "Used for position sizing. Match this value to the percentage commission in Strategy Properties. Changing this input does not change the tester commission. Fees are reserved for both entry and stop exit.")
+int riskSlippageTicks = input.int(0, "Stop slippage, ticks", minval = 0, group = riskCostsGroup, tooltip = "Used for position sizing. Match this value to Slippage in Strategy Properties. Changing this input does not change tester slippage. The stop-limit entry is sized at its maximum buy price.")
+
+string selectedTrendTimeframe = trendTimeframe == "" ? timeframe.period : trendTimeframe
+bool trendOnChart = timeframe.in_seconds(selectedTrendTimeframe) == timeframe.in_seconds()
+
+if natrEnableThreshold <= natrDisableThreshold
+    runtime.error("NATR enable threshold must be above the disable threshold.")
+
+if timeframe.in_seconds(selectedTrendTimeframe) < timeframe.in_seconds()
+    runtime.error("Trend timeframe must be equal to or higher than the chart timeframe.")
+
+// Fill recalculations set exits only. Historical OHLC must not create entry signals here.
+varip float previousPositionSize = 0.0
+varip int previousClosedTrades = 0
+varip int lastExitBar = na
+varip float pendingStopPrice = na
+varip float pendingLimitPrice = na
+bool orderFilled = strategy.position_size != previousPositionSize or strategy.closedtrades != previousClosedTrades
+bool evaluateBar = barstate.isconfirmed and not orderFilled
+
+if strategy.closedtrades > previousClosedTrades
+    lastExitBar := bar_index
+
+if orderFilled
+    pendingStopPrice := na
+    pendingLimitPrice := na
+
+previousPositionSize := strategy.position_size
+previousClosedTrades := strategy.closedtrades
+
+f_markerValue(array<Pivot> pivots, int currentIndex, bool confirmed, bool visible) =>
+    float price = na
+    if confirmed and visible and array.size(pivots) > 0
+        Pivot point = array.get(pivots, array.size(pivots) - 1)
+        if point.knownAt == currentIndex
+            price := point.price
+    price
+
+float natrAtr = ta.atr(natrPeriod)
+float natrValue = not na(close) and close > 0 ? 100 * natrAtr / close : na
+var float closedNatr = na
+var bool natrAcceptable = false
+
+if evaluateBar
+    closedNatr := natrValue
+    natrAcceptable := f_natr_isAcceptable(natrAcceptable, closedNatr, natrDisableThreshold, natrEnableThreshold)
+
+[chartTrendValue, chartTrendDirection] = ta.supertrend(trendFactor, trendAtrPeriod)
+var float closedTrendValue = na
+var float closedTrendDirection = na
+
+if trendOnChart
+    if evaluateBar
+        closedTrendValue := chartTrendValue
+        closedTrendDirection := chartTrendDirection
+else
+    [higherTrendValue, higherTrendDirection] = request.security(syminfo.tickerid, selectedTrendTimeframe, f_supertrend_closed(trendFactor, trendAtrPeriod), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
+    if evaluateBar
+        closedTrendValue := higherTrendValue
+        closedTrendDirection := higherTrendDirection
+
+bool trendReady = not na(closedTrendValue) and not na(closedTrendDirection)
+// ta.supertrend uses negative direction for an uptrend.
+bool trendAcceptable = trendReady and closedTrendDirection < 0
+bool entriesAllowed = natrAcceptable and trendAcceptable
+color entryColor = entriesAllowed ? color.green : color.red
+bgcolor(color.new(entryColor, 90), title = "Entry permission")
+
+var array<Pivot> highPivots = array.new<Pivot>()
+var array<Pivot> lowPivots = array.new<Pivot>()
+var array<Pivot> activeHighLevels = array.new<Pivot>()
+var array<Pivot> activeLowLevels = array.new<Pivot>()
+f_pivot_collectHigh(highPivots, high, pivotSpan, evaluateBar, bar_index, natrAtr, natrValue)
+f_pivot_collectLow(lowPivots, low, pivotSpan, evaluateBar, bar_index, natrAtr, natrValue)
+if evaluateBar
+    f_pivot_pruneWindow(highPivots, bar_index - historyBars + 1)
+    f_pivot_pruneWindow(lowPivots, bar_index - historyBars + 1)
+
+if filterCoveredLevels and evaluateBar
+    f_pivot_pruneWindow(activeHighLevels, bar_index - historyBars + 1)
+    f_pivot_pruneWindow(activeLowLevels, bar_index - historyBars + 1)
+    f_level_update(activeHighLevels, highPivots, low, high, pivotSpan, evaluateBar, bar_index)
+    f_level_update(activeLowLevels, lowPivots, low, high, pivotSpan, evaluateBar, bar_index)
+
+array<Pivot> highLevels = filterCoveredLevels ? activeHighLevels : highPivots
+array<Pivot> lowLevels = filterCoveredLevels ? activeLowLevels : lowPivots
+
+if evaluateBar
+    f_pivot_scoreNearby(highPivots, highLevels, nearbyAtrFactor)
+
+    // Cancel before replacement so an old activated limit cannot remain active.
+    strategy.cancel("Long")
+    pendingStopPrice := na
+    pendingLimitPrice := na
+
+    bool canEnter = strategy.position_size == 0 and entriesAllowed and (na(lastExitBar) or bar_index > lastExitBar)
+    if canEnter
+        float levelPrice = f_entry_level(highLevels, close, minimumTotalScore)
+        if not na(levelPrice)
+            float limitPrice = math.round_to_mintick(levelPrice + entryLimitTicks * syminfo.mintick)
+            [entryStopPrice, _] = f_exit_prices(limitPrice, stopPercent, targetPercent, syminfo.mintick)
+            float riskStopPrice = entryStopPrice - riskSlippageTicks * syminfo.mintick
+            float capital = strategy.convert_to_symbol(strategy.equity)
+            float quantity = f_entry_quantity(capital, limitPrice, riskStopPrice, riskPercent, riskCommissionPercent, syminfo.pointvalue, syminfo.mincontract)
+            if not na(quantity) and quantity > 0
+                strategy.entry("Long", strategy.long, qty = quantity, stop = levelPrice, limit = limitPrice)
+                pendingStopPrice := levelPrice
+                pendingLimitPrice := limitPrice
+
+float tradeStopPrice = na
+float tradeTargetPrice = na
+
+if strategy.position_size > 0
+    [stopPrice, targetPrice] = f_exit_prices(strategy.position_avg_price, stopPercent, targetPercent, syminfo.mintick)
+    if stopPrice <= 0
+        runtime.error("Stop loss price must be positive. Check the symbol tick size and stop loss setting.")
+    tradeStopPrice := stopPrice
+    tradeTargetPrice := targetPrice
+    strategy.exit("Long exit", from_entry = "Long", stop = tradeStopPrice, limit = tradeTargetPrice)
+
+plot(pendingStopPrice, title = "Long entry stop", color = color.orange, style = plot.style_linebr)
+plot(tradeStopPrice, title = "Position stop loss", color = color.red, style = plot.style_linebr)
+plot(tradeTargetPrice, title = "Position take profit", color = color.green, style = plot.style_linebr)
+
+var table entryConditions = table.new(position.top_right, 3, 4, bgcolor = chart.bg_color, frame_color = color.new(chart.fg_color, 70), frame_width = 1)
+
+if barstate.islast
+    string natrText = na(closedNatr) ? "N/A" : str.tostring(closedNatr, "0.000") + "%"
+    string natrStatus = na(closedNatr) ? "Blocked: no data" : natrAcceptable ? "Acceptable" : "Blocked"
+    string trendText = not trendReady ? "N/A" : trendAcceptable ? "UP" : "DOWN"
+    string trendStatus = not trendReady ? "Blocked: no data" : trendAcceptable ? "Acceptable" : "Blocked"
+    color natrColor = natrAcceptable ? color.green : color.red
+    color trendColor = trendAcceptable ? color.green : color.red
+    table.cell(entryConditions, 0, 0, "Entry condition", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 1, 0, "Value", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 2, 0, "Status", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 0, 1, "Supertrend (" + selectedTrendTimeframe + ")", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 1, 1, trendText, text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(trendColor, 80))
+    table.cell(entryConditions, 2, 1, trendStatus, text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(trendColor, 80))
+    table.cell(entryConditions, 0, 2, "NATR", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 1, 2, natrText, text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 2, 2, natrStatus, text_color = chart.fg_color, text_size = size.small, bgcolor = color.new(natrColor, 80))
+    string orderStatus = strategy.position_size > 0 ? "Position open" : not na(pendingStopPrice) ? "Pending" : "No order"
+    table.cell(entryConditions, 0, 3, "Long stop / limit", text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 1, 3, f_pivot_tooltipNumber(pendingStopPrice) + " / " + f_pivot_tooltipNumber(pendingLimitPrice), text_color = chart.fg_color, text_size = size.small)
+    table.cell(entryConditions, 2, 3, orderStatus, text_color = chart.fg_color, text_size = size.small)
+
+float highMarker = f_markerValue(highPivots, bar_index, barstate.isconfirmed, showHighPivots)
+float lowMarker = f_markerValue(lowPivots, bar_index, barstate.isconfirmed, showLowPivots)
+int confirmationWindow = historyBars - pivotSpan
+
+plotshape(confirmationWindow > 0 ? highMarker : na, title = "High pivots", style = shape.diamond, location = location.absolute, color = color.red, offset = -pivotSpan, size = size.tiny, show_last = math.max(1, confirmationWindow))
+plotshape(confirmationWindow > 0 ? lowMarker : na, title = "Low pivots", style = shape.diamond, location = location.absolute, color = color.teal, offset = -pivotSpan, size = size.tiny, show_last = math.max(1, confirmationWindow))
+
+// An open bar must not move the window past the oldest retained closed bar.
+float highBoundary = not barstate.isconfirmed ? highMarker[confirmationWindow] : na
+float lowBoundary = not barstate.isconfirmed ? lowMarker[confirmationWindow] : na
+plotshape(highBoundary, title = "High pivot at window boundary", style = shape.diamond, location = location.absolute, color = color.red, offset = -historyBars, size = size.tiny, show_last = 1)
+plotshape(lowBoundary, title = "Low pivot at window boundary", style = shape.diamond, location = location.absolute, color = color.teal, offset = -historyBars, size = size.tiny, show_last = 1)
+
+var array<line> drawnLevels = array.new<line>()
+var array<label> drawnPivotDetails = array.new<label>()
+
+if not orderFilled and (barstate.islastconfirmedhistory or barstate.islast)
+    for drawing in drawnLevels
+        line.delete(drawing)
+    array.clear(drawnLevels)
+
+    for drawing in drawnPivotDetails
+        label.delete(drawing)
+    array.clear(drawnPivotDetails)
+
+    f_pivot_scoreNearby(lowPivots, lowLevels, nearbyAtrFactor)
+
+    int highIndex = showHighPivots ? array.size(highLevels) - 1 : -1
+    int lowIndex = showLowPivots ? array.size(lowLevels) - 1 : -1
+
+    // Keep the latest visible levels within Pine's shared limit for both sides.
+    while array.size(drawnLevels) < 500 and (highIndex >= 0 or lowIndex >= 0)
+        bool isHigh = lowIndex < 0 or (highIndex >= 0 and array.get(highLevels, highIndex).index >= array.get(lowLevels, lowIndex).index)
+        Pivot point = isHigh ? array.get(highLevels, highIndex) : array.get(lowLevels, lowIndex)
+        if point.totalScore >= minimumTotalScore
+            color levelColor = isHigh ? highLevelColor : lowLevelColor
+            array.push(drawnLevels, line.new(point.index, point.price, bar_index, point.price, extend = extend.none, color = levelColor, style = line.style_arrow_right))
+
+        if isHigh
+            highIndex -= 1
+        else
+            lowIndex -= 1
+
+    int highPivotIndex = showHighPivots ? array.size(highPivots) - 1 : -1
+    int lowPivotIndex = showLowPivots ? array.size(lowPivots) - 1 : -1
+
+    // Keep full-window plotshape markers and add tooltips to the latest 500 pivots.
+    while array.size(drawnPivotDetails) < 500 and (highPivotIndex >= 0 or lowPivotIndex >= 0)
+        bool isHigh = lowPivotIndex < 0 or (highPivotIndex >= 0 and array.get(highPivots, highPivotIndex).index >= array.get(lowPivots, lowPivotIndex).index)
+        Pivot point = isHigh ? array.get(highPivots, highPivotIndex) : array.get(lowPivots, lowPivotIndex)
+        color markerColor = isHigh ? color.red : color.teal
+        array.push(drawnPivotDetails, label.new(point.index, point.price, text = "", xloc = xloc.bar_index, yloc = yloc.price, color = markerColor, style = label.style_diamond, size = size.tiny, tooltip = f_pivot_tooltip(point, nearbyAtrFactor, minimumTotalScore)))
+
+        if isHigh
+            highPivotIndex -= 1
+        else
+            lowPivotIndex -= 1
