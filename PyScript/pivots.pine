@@ -1,5 +1,5 @@
 //@version=6
-indicator("Pivots", overlay = true, max_bars_back = 5000, max_lines_count = 500)
+indicator("Pivots", overlay = true, max_bars_back = 5000, max_lines_count = 500, max_labels_count = 500)
 
 // side: -1 = low, 1 = high. knownAt is the pivot confirmation bar.
 type Pivot
@@ -7,10 +7,12 @@ type Pivot
     int index
     int side
     int knownAt
+    float atr
+    float natr
 
-f_pivot_append(array<Pivot> pivots, float price, int span, int side, bool confirmed, int index) =>
+f_pivot_append(array<Pivot> pivots, float price, int span, int side, bool confirmed, int index, float atr, float natr) =>
     if confirmed and not na(price)
-        array.push(pivots, Pivot.new(price, index - span, side, index))
+        array.push(pivots, Pivot.new(price, index - span, side, index, atr, natr))
 
 f_pivot_price(float source, simple int span, simple int side) =>
     float candidate = source[span]
@@ -37,13 +39,19 @@ f_pivot_pruneWindow(array<Pivot> pivots, int firstIndex) =>
             break
         array.shift(pivots)
 
-f_pivot_collectHigh(array<Pivot> highPivots, float source, simple int span, bool confirmed, int index) =>
+f_pivot_collectHigh(array<Pivot> highPivots, float source, simple int span, bool confirmed, int index, float atr, float natr) =>
     float price = f_pivot_price(source, span, 1)
-    f_pivot_append(highPivots, price, span, 1, confirmed, index)
+    f_pivot_append(highPivots, price, span, 1, confirmed, index, atr[span], natr[span])
 
-f_pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool confirmed, int index) =>
+f_pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool confirmed, int index, float atr, float natr) =>
     float price = f_pivot_price(source, span, -1)
-    f_pivot_append(lowPivots, price, span, -1, confirmed, index)
+    f_pivot_append(lowPivots, price, span, -1, confirmed, index, atr[span], natr[span])
+
+f_pivot_tooltip(Pivot point) =>
+    string sideText = point.side == 1 ? "High" : "Low"
+    string atrText = na(point.atr) ? "N/A" : str.tostring(point.atr, "0.##########")
+    string natrText = na(point.natr) ? "N/A" : str.tostring(point.natr, "0.000") + "%"
+    "Pivot: " + sideText + "\nPrice: " + str.tostring(point.price, format.mintick) + "\nATR: " + atrText + "\nNATR: " + natrText + "\nPivot bar: " + str.tostring(point.index) + "\nConfirmed bar: " + str.tostring(point.knownAt)
 
 f_level_isCovered(float price, float candleLow, float candleHigh) =>
     not na(candleLow) and not na(candleHigh) and int(math.sign(price - candleLow)) >= 0 and int(math.sign(candleHigh - price)) >= 0
@@ -169,8 +177,8 @@ var array<Pivot> highPivots = array.new<Pivot>()
 var array<Pivot> lowPivots = array.new<Pivot>()
 var array<Pivot> activeHighLevels = array.new<Pivot>()
 var array<Pivot> activeLowLevels = array.new<Pivot>()
-f_pivot_collectHigh(highPivots, high, pivotSpan, barstate.isconfirmed, bar_index)
-f_pivot_collectLow(lowPivots, low, pivotSpan, barstate.isconfirmed, bar_index)
+f_pivot_collectHigh(highPivots, high, pivotSpan, barstate.isconfirmed, bar_index, natrAtr, natrValue)
+f_pivot_collectLow(lowPivots, low, pivotSpan, barstate.isconfirmed, bar_index, natrAtr, natrValue)
 if barstate.isconfirmed
     f_pivot_pruneWindow(highPivots, bar_index - historyBars + 1)
     f_pivot_pruneWindow(lowPivots, bar_index - historyBars + 1)
@@ -196,11 +204,16 @@ plotshape(highBoundary, title = "High pivot at window boundary", style = shape.d
 plotshape(lowBoundary, title = "Low pivot at window boundary", style = shape.diamond, location = location.absolute, color = color.teal, offset = -historyBars, size = size.tiny, show_last = 1)
 
 var array<line> drawnLevels = array.new<line>()
+var array<label> drawnPivotDetails = array.new<label>()
 
 if barstate.islastconfirmedhistory or barstate.islast
     for drawing in drawnLevels
         line.delete(drawing)
     array.clear(drawnLevels)
+
+    for drawing in drawnPivotDetails
+        label.delete(drawing)
+    array.clear(drawnPivotDetails)
 
     array<Pivot> highLevels = filterCoveredLevels ? activeHighLevels : highPivots
     array<Pivot> lowLevels = filterCoveredLevels ? activeLowLevels : lowPivots
@@ -218,3 +231,18 @@ if barstate.islastconfirmedhistory or barstate.islast
             highIndex -= 1
         else
             lowIndex -= 1
+
+    int highPivotIndex = showHighPivots ? array.size(highPivots) - 1 : -1
+    int lowPivotIndex = showLowPivots ? array.size(lowPivots) - 1 : -1
+
+    // Keep full-window plotshape markers and add tooltips to the latest 500 pivots.
+    while array.size(drawnPivotDetails) < 500 and (highPivotIndex >= 0 or lowPivotIndex >= 0)
+        bool isHigh = lowPivotIndex < 0 or (highPivotIndex >= 0 and array.get(highPivots, highPivotIndex).index >= array.get(lowPivots, lowPivotIndex).index)
+        Pivot point = isHigh ? array.get(highPivots, highPivotIndex) : array.get(lowPivots, lowPivotIndex)
+        color markerColor = isHigh ? color.red : color.teal
+        array.push(drawnPivotDetails, label.new(point.index, point.price, text = "", xloc = xloc.bar_index, yloc = yloc.price, color = markerColor, style = label.style_diamond, size = size.tiny, tooltip = f_pivot_tooltip(point)))
+
+        if isHigh
+            highPivotIndex -= 1
+        else
+            lowPivotIndex -= 1
