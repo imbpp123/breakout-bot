@@ -195,6 +195,18 @@ f_exit_prices(float entryPrice, float stopPercent, float targetPercent, float ti
     float targetPrice = math.max(math.round(entryPrice * (1.0 + targetPercent / 100.0) / tickSize) * tickSize, entryPrice + tickSize)
     [stopPrice, targetPrice]
 
+f_exit_trailingStop(float previousStop, float highestPrice, float atr, string mode, float atrFactor, float percent, float tickSize) =>
+    float stopPrice = previousStop
+    float distance = switch mode
+        "ATR" => atr * atrFactor
+        "Percent" => highestPrice * percent / 100.0
+        => na
+    if not na(distance) and int(math.sign(distance)) > 0
+        // Round down so the stop stays at least the requested distance below the high.
+        float candidate = math.floor((highestPrice - math.max(distance, tickSize)) / tickSize) * tickSize
+        stopPrice := math.max(previousStop, candidate)
+    stopPrice
+
 int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
 bool showHighPivots = input.bool(true, "Show high pivots")
@@ -220,8 +232,16 @@ float trendFactor = input.float(3.0, "Supertrend multiplier", minval = 0.01, ste
 string tradeGroup = "Backtest orders"
 float riskPercent = input.float(3.0, "Risk per trade, % of equity", minval = 0.01, maxval = 100.0, step = 0.1, group = tradeGroup, tooltip = "Planned loss at the stop, including the risk cost estimates. Position size uses the entry limit price and the rounded stop price. Position value plus the estimated entry fee cannot exceed current equity. A tighter stop can give less risk when the cash limit is reached. Price gaps can exceed the planned risk.")
 float stopPercent = input.float(5.0, "Stop loss, % of entry price", minval = 0.01, maxval = 99.0, step = 0.5, group = tradeGroup)
+bool useTakeProfit = input.bool(true, "Use fixed take profit", group = tradeGroup, tooltip = "Disable to let a position follow the trailing stop without a fixed profit target. The initial stop loss remains active.")
 float targetPercent = input.float(10.0, "Take profit, % of entry price", minval = 0.01, step = 0.5, group = tradeGroup)
 int entryLimitTicks = input.int(0, "Entry limit above level, ticks", minval = 0, group = tradeGroup, tooltip = "Long stop is at the nearest high level above the close. The buy limit is this many ticks above it. A price gap above the limit can leave the entry unfilled. Entry orders are checked and replaced at each bar close.")
+
+string trailingGroup = "Trailing stop"
+string trailingMode = input.string("Off", "Trailing distance mode", options = ["Off", "ATR", "Percent"], group = trailingGroup, tooltip = "Update the stop only at bar close, using the highest high after the entry bar. The stop never moves down. The entry bar is skipped because its high may be before the fill.")
+string trailingAtrSource = input.string("Fixed before entry", "Trailing ATR source", options = ["Fixed before entry", "Current"], group = trailingGroup, tooltip = "Used in ATR mode. Fixed before entry saves ATR from the last closed bar before the entry fill. Current uses ATR from each new closed bar.")
+float trailingAtrFactor = input.float(2.0, "Trailing distance, ATR", minval = 0.01, step = 0.1, group = trailingGroup, tooltip = "Used in ATR mode. Distance uses the selected ATR source and the NATR period from Entry conditions. A larger ATR cannot move the stop down.")
+float trailingPercent = input.float(3.0, "Trailing distance, % of highest price", minval = 0.01, maxval = 99.0, step = 0.1, group = trailingGroup, tooltip = "Used in Percent mode. Distance is this percentage of the highest price tracked for the position.")
+float trailingActivationPercent = input.float(1.0, "Trailing activation, % above entry", minval = 0.0, step = 0.1, group = trailingGroup, tooltip = "Activate when the tracked high reaches this move from the actual entry price. Zero allows activation on the first closed bar after the entry bar. Activation does not guarantee breakeven.")
 
 string riskCostsGroup = "Risk cost estimates"
 float riskCommissionPercent = input.float(0.06, "Commission per fill, %", minval = 0.0, step = 0.01, group = riskCostsGroup, tooltip = "Used for position sizing. Match this value to the percentage commission in Strategy Properties. Changing this input does not change the tester commission. Fees are reserved for both entry and stop exit.")
@@ -334,16 +354,40 @@ if evaluateBar
                 pendingStopPrice := levelPrice
                 pendingLimitPrice := limitPrice
 
-float tradeStopPrice = na
+varip float tradeStopPrice = na
+varip float highestTradePrice = na
+varip float entryAtr = na
+varip bool trailingActive = false
 float tradeTargetPrice = na
 
 if strategy.position_size > 0
     [stopPrice, targetPrice] = f_exit_prices(strategy.position_avg_price, stopPercent, targetPercent, syminfo.mintick)
     if stopPrice <= 0
         runtime.error("Stop loss price must be positive. Check the symbol tick size and stop loss setting.")
-    tradeStopPrice := stopPrice
-    tradeTargetPrice := targetPrice
+    if orderFilled or na(tradeStopPrice)
+        tradeStopPrice := stopPrice
+        highestTradePrice := strategy.position_avg_price
+        // The entry bar's final ATR is not known at an intrabar fill.
+        entryAtr := natrAtr[1]
+        trailingActive := false
+
+    // Fill recalculations and the entry bar must not use highs from before the fill.
+    if trailingMode != "Off" and evaluateBar and bar_index > strategy.opentrades.entry_bar_index(0)
+        highestTradePrice := math.max(highestTradePrice, high)
+        // Compare price ratios to avoid Pine's rounding on low-price symbols.
+        float activationRatio = 1.0 + trailingActivationPercent / 100.0
+        trailingActive := trailingActive or highestTradePrice / strategy.position_avg_price >= activationRatio
+        if trailingActive
+            float trailingAtr = trailingAtrSource == "Fixed before entry" ? entryAtr : natrAtr
+            tradeStopPrice := f_exit_trailingStop(tradeStopPrice, highestTradePrice, trailingAtr, trailingMode, trailingAtrFactor, trailingPercent, syminfo.mintick)
+
+    tradeTargetPrice := useTakeProfit ? targetPrice : na
     strategy.exit("Long exit", from_entry = "Long", stop = tradeStopPrice, limit = tradeTargetPrice)
+else
+    tradeStopPrice := na
+    highestTradePrice := na
+    entryAtr := na
+    trailingActive := false
 
 plot(pendingStopPrice, title = "Long entry stop", color = color.orange, style = plot.style_linebr)
 plot(tradeStopPrice, title = "Position stop loss", color = color.red, style = plot.style_linebr)
