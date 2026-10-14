@@ -10,7 +10,12 @@ type Pivot
     float atr
     float natr
     int nearbyScore = 0
-    int totalScore = 0
+    float proximityScore = 0.0
+    float totalScore = 0.0
+
+type PivotNeighbor
+    Pivot point
+    float distanceAtr
 
 f_pivot_append(array<Pivot> pivots, float price, int span, int side, bool confirmed, int index, float atr, float natr) =>
     if confirmed and not na(price)
@@ -49,11 +54,48 @@ f_pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool c
     float price = f_pivot_price(source, span, -1)
     f_pivot_append(lowPivots, price, span, -1, confirmed, index, atr[span], natr[span])
 
+f_pivot_findNeighbors(Pivot point, array<Pivot> levels, array<int> sortedIndices, int sortedPosition, float factor) =>
+    array<PivotNeighbor> neighbors = array.new<PivotNeighbor>()
+    // Return only later sorted entries so each pair is checked once.
+    if not na(point.atr) and int(math.sign(point.atr)) > 0 and sortedPosition + 1 < array.size(sortedIndices)
+        for j = sortedPosition + 1 to array.size(sortedIndices) - 1
+            Pivot neighbor = array.get(levels, array.get(sortedIndices, j))
+            float distance = math.abs(point.price - neighbor.price)
+            // Compare ATR ratios so Pine's float rounding does not depend on price scale.
+            if distance / point.atr > factor
+                break
+            if not na(neighbor.atr) and int(math.sign(neighbor.atr)) > 0
+                float pairAtr = math.min(point.atr, neighbor.atr)
+                float distanceAtr = distance / pairAtr
+                if distanceAtr <= factor and (factor > 0 or int(math.sign(distance)) == 0)
+                    array.push(neighbors, PivotNeighbor.new(neighbor, distanceAtr))
+    neighbors
+
+f_pivot_scoreCount(Pivot point, array<PivotNeighbor> neighbors) =>
+    point.nearbyScore += array.size(neighbors)
+    for neighbor in neighbors
+        Pivot other = neighbor.point
+        other.nearbyScore += 1
+
+f_pivot_scoreProximity(Pivot point, array<PivotNeighbor> neighbors, float factor) =>
+    for neighbor in neighbors
+        float distanceAtr = neighbor.distanceAtr
+        // A zero factor accepts equal prices and gives the full bonus.
+        float proximityBonus = factor > 0 ? math.max(0.0, 1.0 - distanceAtr / factor) : 1.0
+        Pivot other = neighbor.point
+        point.proximityScore += proximityBonus
+        other.proximityScore += proximityBonus
+
+f_pivot_scoreTotal(array<Pivot> levels) =>
+    for point in levels
+        point.totalScore := point.nearbyScore + point.proximityScore
+
 f_pivot_scoreNearby(array<Pivot> pivots, array<Pivot> levels, float factor) =>
     // Scores use current levels, not a snapshot from the confirmation bar.
     for point in pivots
         point.nearbyScore := 0
-        point.totalScore := 0
+        point.proximityScore := 0.0
+        point.totalScore := 0.0
 
     int count = array.size(levels)
     if count > 1
@@ -64,27 +106,17 @@ f_pivot_scoreNearby(array<Pivot> pivots, array<Pivot> levels, float factor) =>
 
         for i = 0 to count - 2
             Pivot point = array.get(levels, array.get(sortedIndices, i))
-            if not na(point.atr) and int(math.sign(point.atr)) > 0
-                for j = i + 1 to count - 1
-                    Pivot neighbor = array.get(levels, array.get(sortedIndices, j))
-                    float distance = math.abs(point.price - neighbor.price)
-                    // Compare ATR ratios so Pine's float rounding does not depend on price scale.
-                    if distance / point.atr > factor
-                        break
-                    if not na(neighbor.atr) and int(math.sign(neighbor.atr)) > 0
-                        float pairAtr = math.min(point.atr, neighbor.atr)
-                        if distance / pairAtr <= factor and (factor > 0 or int(math.sign(distance)) == 0)
-                            point.nearbyScore += 1
-                            neighbor.nearbyScore += 1
+            array<PivotNeighbor> neighbors = f_pivot_findNeighbors(point, levels, sortedIndices, i, factor)
+            f_pivot_scoreCount(point, neighbors)
+            f_pivot_scoreProximity(point, neighbors, factor)
 
-    for point in levels
-        point.totalScore := point.nearbyScore
+    f_pivot_scoreTotal(levels)
 
 f_pivot_tooltip(Pivot point) =>
     string sideText = point.side == 1 ? "High" : "Low"
     string atrText = na(point.atr) ? "N/A" : str.tostring(point.atr, "0.##########")
     string natrText = na(point.natr) ? "N/A" : str.tostring(point.natr, "0.000") + "%"
-    "Pivot: " + sideText + "\nPrice: " + str.tostring(point.price, format.mintick) + "\nATR: " + atrText + "\nNATR: " + natrText + "\nNearby score: " + str.tostring(point.nearbyScore) + "\nTotal score: " + str.tostring(point.totalScore) + "\nPivot bar: " + str.tostring(point.index) + "\nConfirmed bar: " + str.tostring(point.knownAt)
+    "Pivot: " + sideText + "\nPrice: " + str.tostring(point.price, format.mintick) + "\nATR: " + atrText + "\nNATR: " + natrText + "\nNearby pivots: " + str.tostring(point.nearbyScore) + "\nProximity score: " + str.tostring(point.proximityScore, "0.000") + "\nWeighted nearby score: " + str.tostring(point.nearbyScore + point.proximityScore, "0.000") + "\nTotal score: " + str.tostring(point.totalScore, "0.000")
 
 f_level_isCovered(float price, float candleLow, float candleHigh) =>
     not na(candleLow) and not na(candleHigh) and int(math.sign(price - candleLow)) >= 0 and int(math.sign(candleHigh - price)) >= 0
@@ -132,7 +164,7 @@ color highLevelColor = input.color(color.red, "High pivot level color")
 color lowLevelColor = input.color(color.teal, "Low pivot level color")
 
 string scoreGroup = "Pivot score"
-float nearbyAtrFactor = input.float(0.2, "Nearby pivot distance, ATR", minval = 0.0, step = 0.05, group = scoreGroup, tooltip = "Each nearby pivot of the same side adds one point. Distance must be at most this factor times the smaller pivot ATR. Scores use levels kept by the covered-level filter.")
+float nearbyAtrFactor = input.float(0.2, "Nearby pivot distance, ATR", minval = 0.0, step = 0.05, group = scoreGroup, tooltip = "Each nearby pivot of the same side adds 1 point plus a proximity bonus from 0 to 1. Distance must be at most this factor times the smaller pivot ATR. Equal prices get the full bonus, including when this factor is zero. Scores use levels kept by the covered-level filter.")
 
 string entryGroup = "Entry conditions"
 int natrPeriod = input.int(14, "NATR period", minval = 1, maxval = 5000, group = entryGroup)
