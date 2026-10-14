@@ -116,7 +116,7 @@ f_pivot_tooltip(Pivot point) =>
     string sideText = point.side == 1 ? "High" : "Low"
     string atrText = na(point.atr) ? "N/A" : str.tostring(point.atr, "0.##########")
     string natrText = na(point.natr) ? "N/A" : str.tostring(point.natr, "0.000") + "%"
-    "Pivot: " + sideText + "\nPrice: " + str.tostring(point.price, format.mintick) + "\nATR: " + atrText + "\nNATR: " + natrText + "\nNearby pivots: " + str.tostring(point.nearbyScore) + "\nProximity score: " + str.tostring(point.proximityScore, "0.000") + "\nWeighted nearby score: " + str.tostring(point.nearbyScore + point.proximityScore, "0.000") + "\nTotal score: " + str.tostring(point.totalScore, "0.000")
+    "Pivot: " + sideText + "\nPrice: " + str.tostring(point.price, format.mintick) + "\nATR: " + atrText + "\nNATR: " + natrText + "\nNearby pivots: " + str.tostring(point.nearbyScore) + "\nProximity score: " + str.tostring(point.proximityScore, "0.000") + "\nTotal score: " + str.tostring(point.totalScore, "0.000")
 
 f_level_isCovered(float price, float candleLow, float candleHigh) =>
     not na(candleLow) and not na(candleHigh) and int(math.sign(price - candleLow)) >= 0 and int(math.sign(candleHigh - price)) >= 0
