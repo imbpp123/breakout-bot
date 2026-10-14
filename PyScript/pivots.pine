@@ -128,8 +128,14 @@ f_pivot_tooltip(Pivot point, float factor, float minimumScore) =>
     string details = "Price: " + f_pivot_tooltipNumber(point.price) + "\nATR: " + f_pivot_tooltipNumber(point.atr) + "\nNATR: " + natrText
     details + "\n\n" + f_pivot_searchTooltip(point, factor) + "\n\n" + f_pivot_scoresTooltip(point, minimumScore)
 
-f_level_isCovered(float price, float candleLow, float candleHigh) =>
-    not na(candleLow) and not na(candleHigh) and int(math.sign(price - candleLow)) >= 0 and int(math.sign(candleHigh - price)) >= 0
+f_level_isCovered(Pivot point, float candleLow, float candleHigh) =>
+    bool covered = false
+    if not na(candleLow) and not na(candleHigh)
+        int lowOrder = int(math.sign(point.price - candleLow))
+        int highOrder = int(math.sign(candleHigh - point.price))
+        // Equal highs or lows can form another pivot at the same level.
+        covered := point.side == 1 ? lowOrder >= 0 and highOrder > 0 : lowOrder > 0 and highOrder >= 0
+    covered
 
 f_level_update(array<Pivot> activeLevels, array<Pivot> pivots, float candleLow, float candleHigh, simple int span, bool confirmed, int index) =>
     int count = array.size(activeLevels)
@@ -137,7 +143,7 @@ f_level_update(array<Pivot> activeLevels, array<Pivot> pivots, float candleLow, 
         for step = 0 to count - 1
             int i = count - 1 - step
             Pivot point = array.get(activeLevels, i)
-            if f_level_isCovered(point.price, candleLow, candleHigh)
+            if f_level_isCovered(point, candleLow, candleHigh)
                 array.remove(activeLevels, i)
 
     if confirmed and array.size(pivots) > 0
@@ -146,7 +152,7 @@ f_level_update(array<Pivot> activeLevels, array<Pivot> pivots, float candleLow, 
             bool covered = false
             // Check later candles in the confirmation window, but not the pivot candle.
             for offset = 0 to span - 1
-                if f_level_isCovered(point.price, candleLow[offset], candleHigh[offset])
+                if f_level_isCovered(point, candleLow[offset], candleHigh[offset])
                     covered := true
                     break
             if not covered
@@ -169,7 +175,7 @@ int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 
 int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
 bool showHighPivots = input.bool(true, "Show high pivots")
 bool showLowPivots = input.bool(true, "Show low pivots")
-bool filterCoveredLevels = input.bool(true, "Hide covered pivot levels", tooltip = "Hide a level after any later candle touches its price, including wicks and the current open candle. Pivot markers stay visible.")
+bool filterCoveredLevels = input.bool(true, "Hide covered pivot levels", tooltip = "Hide a level when a later candle covers its price and moves past it: above for highs, below for lows. Equal highs or lows keep the level. Includes wicks and the current open candle. Pivot markers stay visible.")
 color highLevelColor = input.color(color.red, "High pivot level color")
 color lowLevelColor = input.color(color.teal, "Low pivot level color")
 
