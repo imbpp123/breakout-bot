@@ -1,17 +1,66 @@
 //@version=6
 strategy("Pivots strategy", overlay = true, initial_capital = 10000, pyramiding = 0, margin_long = 100, commission_type = strategy.commission.percent, commission_value = 0.06, calc_on_every_tick = false, calc_on_order_fills = true, process_orders_on_close = false, max_bars_back = 5000, max_lines_count = 500, max_labels_count = 500)
 
+// Configuration
+int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
+int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
+bool showHighPivots = input.bool(true, "Show high pivots")
+bool showLowPivots = input.bool(true, "Show low pivots")
+bool filterCoveredLevels = input.bool(true, "Hide covered pivot levels", tooltip = "Remove a level when a later closed candle covers its price and moves past it: above for highs, below for lows. Equal highs or lows keep the level. Includes wicks. Pivot markers stay visible.")
+color highLevelColor = input.color(color.red, "High pivot level color")
+color lowLevelColor = input.color(color.teal, "Low pivot level color")
+
+string scoreGroup = "Pivot score"
+float nearbyAtrFactor = input.float(0.4, "Nearby pivot distance, ATR", minval = 0.0, step = 0.05, group = scoreGroup, tooltip = "Each nearby pivot of the same side adds 1 point plus a proximity bonus from 0 to 1. Distance must be at most this factor times the smaller pivot ATR. Equal prices get the full bonus, including when this factor is zero. Scores use levels kept by the covered-level filter.")
+float minimumTotalScore = input.float(1.0, "Minimum total score for lines and entries", minval = 0.0, step = 0.1, group = scoreGroup, tooltip = "Show pivot lines and allow entries only when the total score is at least this value. Pivot markers and tooltips stay visible. This filter does not change neighbor scores.")
+
+string entryGroup = "Entry conditions"
+int natrPeriod = input.int(14, "NATR period", minval = 1, maxval = 5000, group = entryGroup)
+float natrDisableThreshold = input.float(1.1, "NATR disable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Block entries when NATR closes at or below this value.")
+float natrEnableThreshold = input.float(1.2, "NATR enable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Allow entries when NATR closes at or above this value. Must be above the disable threshold.")
+
+string trendGroup = "Global trend"
+string trendTimeframe = input.timeframe("1D", "Trend timeframe", group = trendGroup, tooltip = "Use the last closed Supertrend bar. The timeframe must be equal to or higher than the chart timeframe.")
+int trendAtrPeriod = input.int(10, "Supertrend ATR period", minval = 1, maxval = 5000, group = trendGroup)
+float trendFactor = input.float(3.0, "Supertrend multiplier", minval = 0.01, step = 0.1, group = trendGroup)
+
+string tradeGroup = "Backtest orders"
+float riskPercent = input.float(3.0, "Risk per trade, % of equity", minval = 0.01, maxval = 100.0, step = 0.1, group = tradeGroup, tooltip = "Planned loss at the stop, including the risk cost estimates. Position size uses the entry limit price and the rounded stop price. Position value plus the estimated entry fee cannot exceed current equity. A tighter stop can give less risk when the cash limit is reached. Price gaps can exceed the planned risk.")
+float stopPercent = input.float(5.0, "Stop loss, % of entry price", minval = 0.01, maxval = 99.0, step = 0.5, group = tradeGroup)
+bool useTakeProfit = input.bool(true, "Use fixed take profit", group = tradeGroup, tooltip = "Disable to let a position follow the trailing stop without a fixed profit target. The initial stop loss remains active.")
+float targetPercent = input.float(10.0, "Take profit, % of entry price", minval = 0.01, step = 0.5, group = tradeGroup)
+int entryLimitTicks = input.int(0, "Entry limit above level, ticks", minval = 0, group = tradeGroup, tooltip = "Long stop is at the nearest high level above the close. The buy limit is this many ticks above it. A price gap above the limit can leave the entry unfilled. Entry orders are checked and replaced at each bar close.")
+
+string trailingGroup = "Trailing stop"
+string trailingMode = input.string("Off", "Trailing distance mode", options = ["Off", "ATR", "Percent"], group = trailingGroup, tooltip = "Update the stop only at bar close, using the highest high after the entry bar. The stop never moves down. The entry bar is skipped because its high may be before the fill.")
+string trailingAtrSource = input.string("Fixed before entry", "Trailing ATR source", options = ["Fixed before entry", "Current"], group = trailingGroup, tooltip = "Used in ATR mode. Fixed before entry saves ATR from the last closed bar before the entry fill. Current uses ATR from each new closed bar.")
+float trailingAtrFactor = input.float(2.0, "Trailing distance, ATR", minval = 0.01, step = 0.1, group = trailingGroup, tooltip = "Used in ATR mode. Distance uses the selected ATR source and the NATR period from Entry conditions. A larger ATR cannot move the stop down.")
+float trailingPercent = input.float(3.0, "Trailing distance, % of highest price", minval = 0.01, maxval = 99.0, step = 0.1, group = trailingGroup, tooltip = "Used in Percent mode. Distance is this percentage of the highest price tracked for the position.")
+float trailingActivationPercent = input.float(1.0, "Trailing activation, % above entry", minval = 0.0, step = 0.1, group = trailingGroup, tooltip = "Activate when the tracked high reaches this move from the actual entry price. Zero allows activation on the first closed bar after the entry bar. Activation does not guarantee breakeven.")
+
+string riskCostsGroup = "Risk cost estimates"
+float riskCommissionPercent = input.float(0.06, "Commission per fill, %", minval = 0.0, step = 0.01, group = riskCostsGroup, tooltip = "Used for position sizing. Match this value to the percentage commission in Strategy Properties. Changing this input does not change the tester commission. Fees are reserved for both entry and stop exit.")
+int riskSlippageTicks = input.int(0, "Stop slippage, ticks", minval = 0, group = riskCostsGroup, tooltip = "Used for position sizing. Match this value to Slippage in Strategy Properties. Changing this input does not change tester slippage. The stop-limit entry is sized at its maximum buy price.")
+
+// End of configuration
+
+type PivotScore
+    int nearby = 0
+    float proximity = 0.0
+    float total = 0.0
+
+type PivotVolatility
+    float atr
+    float natr
+
 // side: -1 = low, 1 = high. knownAt is the pivot confirmation bar.
 type Pivot
     float price
     int index
     int side
     int knownAt
-    float atr
-    float natr
-    int nearbyScore = 0
-    float proximityScore = 0.0
-    float totalScore = 0.0
+    PivotVolatility volatility
+    PivotScore score
 
 type PivotNeighbor
     Pivot point
@@ -19,7 +68,7 @@ type PivotNeighbor
 
 f_pivot_append(array<Pivot> pivots, float price, int span, int side, bool confirmed, int index, float atr, float natr) =>
     if confirmed and not na(price)
-        array.push(pivots, Pivot.new(price, index - span, side, index, atr, natr))
+        array.push(pivots, Pivot.new(price, index - span, side, index, PivotVolatility.new(atr, natr), PivotScore.new()))
 
 f_pivot_price(float source, simple int span, simple int side) =>
     float candidate = source[span]
@@ -57,25 +106,25 @@ f_pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool c
 f_pivot_findNeighbors(Pivot point, array<Pivot> levels, array<int> sortedIndices, int sortedPosition, float factor) =>
     array<PivotNeighbor> neighbors = array.new<PivotNeighbor>()
     // Return only later sorted entries so each pair is checked once.
-    if not na(point.atr) and int(math.sign(point.atr)) > 0 and sortedPosition + 1 < array.size(sortedIndices)
+    if not na(point.volatility.atr) and int(math.sign(point.volatility.atr)) > 0 and sortedPosition + 1 < array.size(sortedIndices)
         for j = sortedPosition + 1 to array.size(sortedIndices) - 1
             Pivot neighbor = array.get(levels, array.get(sortedIndices, j))
             float distance = math.abs(point.price - neighbor.price)
             // Compare ATR ratios so Pine's float rounding does not depend on price scale.
-            if distance / point.atr > factor
+            if distance / point.volatility.atr > factor
                 break
-            if not na(neighbor.atr) and int(math.sign(neighbor.atr)) > 0
-                float pairAtr = math.min(point.atr, neighbor.atr)
+            if not na(neighbor.volatility.atr) and int(math.sign(neighbor.volatility.atr)) > 0
+                float pairAtr = math.min(point.volatility.atr, neighbor.volatility.atr)
                 float distanceAtr = distance / pairAtr
                 if distanceAtr <= factor and (factor > 0 or int(math.sign(distance)) == 0)
                     array.push(neighbors, PivotNeighbor.new(neighbor, distanceAtr))
     neighbors
 
 f_pivot_scoreCount(Pivot point, array<PivotNeighbor> neighbors) =>
-    point.nearbyScore += array.size(neighbors)
+    point.score.nearby += array.size(neighbors)
     for neighbor in neighbors
         Pivot other = neighbor.point
-        other.nearbyScore += 1
+        other.score.nearby += 1
 
 f_pivot_scoreProximity(Pivot point, array<PivotNeighbor> neighbors, float factor) =>
     for neighbor in neighbors
@@ -83,19 +132,19 @@ f_pivot_scoreProximity(Pivot point, array<PivotNeighbor> neighbors, float factor
         // A zero factor accepts equal prices and gives the full bonus.
         float proximityBonus = factor > 0 ? math.max(0.0, 1.0 - distanceAtr / factor) : 1.0
         Pivot other = neighbor.point
-        point.proximityScore += proximityBonus
-        other.proximityScore += proximityBonus
+        point.score.proximity += proximityBonus
+        other.score.proximity += proximityBonus
 
 f_pivot_scoreTotal(array<Pivot> levels) =>
     for point in levels
-        point.totalScore := point.nearbyScore + point.proximityScore
+        point.score.total := point.score.nearby + point.score.proximity
 
 f_pivot_scoreNearby(array<Pivot> pivots, array<Pivot> levels, float factor) =>
     // Scores use current levels, not a snapshot from the confirmation bar.
     for point in pivots
-        point.nearbyScore := 0
-        point.proximityScore := 0.0
-        point.totalScore := 0.0
+        point.score.nearby := 0
+        point.score.proximity := 0.0
+        point.score.total := 0.0
 
     int count = array.size(levels)
     if count > 1
@@ -116,16 +165,16 @@ f_pivot_tooltipNumber(float value) =>
     na(value) ? "N/A" : str.tostring(value, "0.########")
 
 f_pivot_searchTooltip(Pivot point, float factor) =>
-    bool atrReady = not na(point.atr) and int(math.sign(point.atr)) > 0
-    float radius = atrReady ? factor * point.atr : na
+    bool atrReady = not na(point.volatility.atr) and int(math.sign(point.volatility.atr)) > 0
+    float radius = atrReady ? factor * point.volatility.atr : na
     "NEIGHBOR SEARCH\nOwn max distance: " + f_pivot_tooltipNumber(radius) + "\nLower bound: " + f_pivot_tooltipNumber(point.price - radius) + "\nUpper bound: " + f_pivot_tooltipNumber(point.price + radius)
 
 f_pivot_scoresTooltip(Pivot point, float minimumScore) =>
-    "SCORE\nNearby pivots: " + str.tostring(point.nearbyScore) + "\nProximity score: " + f_pivot_tooltipNumber(point.proximityScore) + "\nTotal score: " + f_pivot_tooltipNumber(point.totalScore) + "\nMinimum line score: " + f_pivot_tooltipNumber(minimumScore)
+    "SCORE\nNearby pivots: " + str.tostring(point.score.nearby) + "\nProximity score: " + f_pivot_tooltipNumber(point.score.proximity) + "\nTotal score: " + f_pivot_tooltipNumber(point.score.total) + "\nMinimum line score: " + f_pivot_tooltipNumber(minimumScore)
 
 f_pivot_tooltip(Pivot point, float factor, float minimumScore) =>
-    string natrText = na(point.natr) ? "N/A" : f_pivot_tooltipNumber(point.natr) + "%"
-    string details = "Price: " + f_pivot_tooltipNumber(point.price) + "\nATR: " + f_pivot_tooltipNumber(point.atr) + "\nNATR: " + natrText
+    string natrText = na(point.volatility.natr) ? "N/A" : f_pivot_tooltipNumber(point.volatility.natr) + "%"
+    string details = "Price: " + f_pivot_tooltipNumber(point.price) + "\nATR: " + f_pivot_tooltipNumber(point.volatility.atr) + "\nNATR: " + natrText
     details + "\n\n" + f_pivot_searchTooltip(point, factor) + "\n\n" + f_pivot_scoresTooltip(point, minimumScore)
 
 f_level_isCovered(Pivot point, float candleLow, float candleHigh) =>
@@ -174,7 +223,7 @@ f_supertrend_closed(simple float factor, simple int period) =>
 f_entry_level(array<Pivot> levels, float price, float minimumScore) =>
     float selectedPrice = na
     for point in levels
-        if point.totalScore >= minimumScore and point.price > price
+        if point.score.total >= minimumScore and point.price > price
             if na(selectedPrice) or point.price < selectedPrice
                 selectedPrice := point.price
     selectedPrice
@@ -206,46 +255,6 @@ f_exit_trailingStop(float previousStop, float highestPrice, float atr, string mo
         float candidate = math.floor((highestPrice - math.max(distance, tickSize)) / tickSize) * tickSize
         stopPrice := math.max(previousStop, candidate)
     stopPrice
-
-int historyBars = input.int(1000, "History window, bars", minval = 50, maxval = 5000, tooltip = "Number of latest closed bars whose pivots are kept. Left confirmation bars may be outside this window.")
-int pivotSpan = input.int(5, "Pivot bars on each side", minval = 1, maxval = 50, tooltip = "Bars required on each side. A pivot is confirmed only after this many later bars close.")
-bool showHighPivots = input.bool(true, "Show high pivots")
-bool showLowPivots = input.bool(true, "Show low pivots")
-bool filterCoveredLevels = input.bool(true, "Hide covered pivot levels", tooltip = "Remove a level when a later closed candle covers its price and moves past it: above for highs, below for lows. Equal highs or lows keep the level. Includes wicks. Pivot markers stay visible.")
-color highLevelColor = input.color(color.red, "High pivot level color")
-color lowLevelColor = input.color(color.teal, "Low pivot level color")
-
-string scoreGroup = "Pivot score"
-float nearbyAtrFactor = input.float(0.4, "Nearby pivot distance, ATR", minval = 0.0, step = 0.05, group = scoreGroup, tooltip = "Each nearby pivot of the same side adds 1 point plus a proximity bonus from 0 to 1. Distance must be at most this factor times the smaller pivot ATR. Equal prices get the full bonus, including when this factor is zero. Scores use levels kept by the covered-level filter.")
-float minimumTotalScore = input.float(1.0, "Minimum total score for lines and entries", minval = 0.0, step = 0.1, group = scoreGroup, tooltip = "Show pivot lines and allow entries only when the total score is at least this value. Pivot markers and tooltips stay visible. This filter does not change neighbor scores.")
-
-string entryGroup = "Entry conditions"
-int natrPeriod = input.int(14, "NATR period", minval = 1, maxval = 5000, group = entryGroup)
-float natrDisableThreshold = input.float(1.1, "NATR disable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Block entries when NATR closes at or below this value.")
-float natrEnableThreshold = input.float(1.2, "NATR enable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Allow entries when NATR closes at or above this value. Must be above the disable threshold.")
-
-string trendGroup = "Global trend"
-string trendTimeframe = input.timeframe("1D", "Trend timeframe", group = trendGroup, tooltip = "Use the last closed Supertrend bar. The timeframe must be equal to or higher than the chart timeframe.")
-int trendAtrPeriod = input.int(10, "Supertrend ATR period", minval = 1, maxval = 5000, group = trendGroup)
-float trendFactor = input.float(3.0, "Supertrend multiplier", minval = 0.01, step = 0.1, group = trendGroup)
-
-string tradeGroup = "Backtest orders"
-float riskPercent = input.float(3.0, "Risk per trade, % of equity", minval = 0.01, maxval = 100.0, step = 0.1, group = tradeGroup, tooltip = "Planned loss at the stop, including the risk cost estimates. Position size uses the entry limit price and the rounded stop price. Position value plus the estimated entry fee cannot exceed current equity. A tighter stop can give less risk when the cash limit is reached. Price gaps can exceed the planned risk.")
-float stopPercent = input.float(5.0, "Stop loss, % of entry price", minval = 0.01, maxval = 99.0, step = 0.5, group = tradeGroup)
-bool useTakeProfit = input.bool(true, "Use fixed take profit", group = tradeGroup, tooltip = "Disable to let a position follow the trailing stop without a fixed profit target. The initial stop loss remains active.")
-float targetPercent = input.float(10.0, "Take profit, % of entry price", minval = 0.01, step = 0.5, group = tradeGroup)
-int entryLimitTicks = input.int(0, "Entry limit above level, ticks", minval = 0, group = tradeGroup, tooltip = "Long stop is at the nearest high level above the close. The buy limit is this many ticks above it. A price gap above the limit can leave the entry unfilled. Entry orders are checked and replaced at each bar close.")
-
-string trailingGroup = "Trailing stop"
-string trailingMode = input.string("Off", "Trailing distance mode", options = ["Off", "ATR", "Percent"], group = trailingGroup, tooltip = "Update the stop only at bar close, using the highest high after the entry bar. The stop never moves down. The entry bar is skipped because its high may be before the fill.")
-string trailingAtrSource = input.string("Fixed before entry", "Trailing ATR source", options = ["Fixed before entry", "Current"], group = trailingGroup, tooltip = "Used in ATR mode. Fixed before entry saves ATR from the last closed bar before the entry fill. Current uses ATR from each new closed bar.")
-float trailingAtrFactor = input.float(2.0, "Trailing distance, ATR", minval = 0.01, step = 0.1, group = trailingGroup, tooltip = "Used in ATR mode. Distance uses the selected ATR source and the NATR period from Entry conditions. A larger ATR cannot move the stop down.")
-float trailingPercent = input.float(3.0, "Trailing distance, % of highest price", minval = 0.01, maxval = 99.0, step = 0.1, group = trailingGroup, tooltip = "Used in Percent mode. Distance is this percentage of the highest price tracked for the position.")
-float trailingActivationPercent = input.float(1.0, "Trailing activation, % above entry", minval = 0.0, step = 0.1, group = trailingGroup, tooltip = "Activate when the tracked high reaches this move from the actual entry price. Zero allows activation on the first closed bar after the entry bar. Activation does not guarantee breakeven.")
-
-string riskCostsGroup = "Risk cost estimates"
-float riskCommissionPercent = input.float(0.06, "Commission per fill, %", minval = 0.0, step = 0.01, group = riskCostsGroup, tooltip = "Used for position sizing. Match this value to the percentage commission in Strategy Properties. Changing this input does not change the tester commission. Fees are reserved for both entry and stop exit.")
-int riskSlippageTicks = input.int(0, "Stop slippage, ticks", minval = 0, group = riskCostsGroup, tooltip = "Used for position sizing. Match this value to Slippage in Strategy Properties. Changing this input does not change tester slippage. The stop-limit entry is sized at its maximum buy price.")
 
 string selectedTrendTimeframe = trendTimeframe == "" ? timeframe.period : trendTimeframe
 bool trendOnChart = timeframe.in_seconds(selectedTrendTimeframe) == timeframe.in_seconds()
@@ -450,7 +459,7 @@ if not orderFilled and (barstate.islastconfirmedhistory or barstate.islast)
     while array.size(drawnLevels) < 500 and (highIndex >= 0 or lowIndex >= 0)
         bool isHigh = lowIndex < 0 or (highIndex >= 0 and array.get(highLevels, highIndex).index >= array.get(lowLevels, lowIndex).index)
         Pivot point = isHigh ? array.get(highLevels, highIndex) : array.get(lowLevels, lowIndex)
-        if point.totalScore >= minimumTotalScore
+        if point.score.total >= minimumTotalScore
             color levelColor = isHigh ? highLevelColor : lowLevelColor
             array.push(drawnLevels, line.new(point.index, point.price, bar_index, point.price, extend = extend.none, color = levelColor, style = line.style_arrow_right))
 
