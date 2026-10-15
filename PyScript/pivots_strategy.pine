@@ -26,7 +26,8 @@ float natrDisableThreshold = input.float(1.1, "NATR disable threshold, %", minva
 float natrEnableThreshold = input.float(1.2, "NATR enable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Allow entries when NATR closes at or above this value. Must be above the disable threshold.")
 
 string trendGroup = "Global trend"
-string trendTimeframe = input.timeframe("1D", "Trend timeframe", group = trendGroup, tooltip = "Use the last closed Supertrend bar. The timeframe must be equal to or higher than the chart timeframe.")
+bool useGlobalTrend = input.bool(true, "Use global trend filter", group = trendGroup, tooltip = "Require an uptrend on the last closed Supertrend bar for long entries. Disable to ignore the trend direction and missing trend data. Other entry conditions still apply.")
+string trendTimeframe = input.timeframe("1D", "Trend timeframe", group = trendGroup, tooltip = "Use the last closed Supertrend bar. When the filter is enabled, the timeframe must be equal to or higher than the chart timeframe.")
 int trendAtrPeriod = input.int(10, "Supertrend ATR period", minval = 1, maxval = 5000, group = trendGroup)
 float trendFactor = input.float(3.0, "Supertrend multiplier", minval = 0.01, step = 0.1, group = trendGroup)
 
@@ -311,7 +312,7 @@ bool trendOnChart = timeframe.in_seconds(selectedTrendTimeframe) == timeframe.in
 if natrEnableThreshold <= natrDisableThreshold
     runtime.error("NATR enable threshold must be above the disable threshold.")
 
-if timeframe.in_seconds(selectedTrendTimeframe) < timeframe.in_seconds()
+if useGlobalTrend and timeframe.in_seconds(selectedTrendTimeframe) < timeframe.in_seconds()
     runtime.error("Trend timeframe must be equal to or higher than the chart timeframe.")
 
 if timeframe.in_seconds(confirmationTimeframe) <= timeframe.in_seconds()
@@ -370,7 +371,7 @@ else
 bool trendReady = not na(closedTrendValue) and not na(closedTrendDirection)
 // ta.supertrend uses negative direction for an uptrend.
 bool trendAcceptable = trendReady and closedTrendDirection < 0
-bool entriesAllowed = natrAcceptable and trendAcceptable
+bool entriesAllowed = natrAcceptable and (not useGlobalTrend or trendAcceptable)
 color entryColor = entriesAllowed ? color.green : color.red
 bgcolor(color.new(entryColor, 90), title = "Entry permission")
 
@@ -474,9 +475,9 @@ if barstate.islast
     string natrText = na(closedNatr) ? "N/A" : str.tostring(closedNatr, "0.000") + "%"
     string natrStatus = na(closedNatr) ? "Blocked: no data" : natrAcceptable ? "Acceptable" : "Blocked"
     string trendText = not trendReady ? "N/A" : trendAcceptable ? "UP" : "DOWN"
-    string trendStatus = not trendReady ? "Blocked: no data" : trendAcceptable ? "Acceptable" : "Blocked"
+    string trendStatus = not useGlobalTrend ? "Disabled" : not trendReady ? "Blocked: no data" : trendAcceptable ? "Acceptable" : "Blocked"
     color natrColor = natrAcceptable ? color.green : color.red
-    color trendColor = trendAcceptable ? color.green : color.red
+    color trendColor = not useGlobalTrend ? color.gray : trendAcceptable ? color.green : color.red
     table.cell(entryConditions, 0, 0, "Entry condition", text_color = chart.fg_color, text_size = size.small)
     table.cell(entryConditions, 1, 0, "Value", text_color = chart.fg_color, text_size = size.small)
     table.cell(entryConditions, 2, 0, "Status", text_color = chart.fg_color, text_size = size.small)
