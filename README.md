@@ -21,6 +21,7 @@
 
 - [Прототип стратегии](PyScript/docs/pine-prototype.md)
 - [Индикатор pivot](docs/library/pivots.md)
+- [Стратегия Pivots: подтверждение пивота на старшем таймфрейме](docs/strategy/pivots-confirmation.md)
 - [Стратегия Pivots: риск и размер позиции](docs/strategy/04-position-and-risk.md#бэктест-pivots)
 - [Pivot: определение и общий контракт](PyScript/docs/library/pivot.md)
 - [Pivot: реализация библиотеки в Pine Script](PyScript/docs/library/pivot-pine.md)

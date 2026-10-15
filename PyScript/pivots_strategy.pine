@@ -14,6 +14,12 @@ string scoreGroup = "Pivot score"
 float nearbyAtrFactor = input.float(0.4, "Nearby pivot distance, ATR", minval = 0.0, step = 0.05, group = scoreGroup, tooltip = "Each nearby pivot of the same side adds 1 point plus a proximity bonus from 0 to 1. Distance must be at most this factor times the smaller pivot ATR. Equal prices get the full bonus, including when this factor is zero. Scores use levels kept by the covered-level filter.")
 float minimumTotalScore = input.float(1.0, "Minimum total score for lines and entries", minval = 0.0, step = 0.1, group = scoreGroup, tooltip = "Show pivot lines and allow entries only when the total score is at least this value. Pivot markers and tooltips stay visible. This filter does not change neighbor scores.")
 
+string confirmationGroup = "Pivot confirmation"
+string confirmationTimeframe = input.timeframe("60", "Confirmation timeframe", group = confirmationGroup, tooltip = "Must be higher than the chart timeframe. Match the same high or low at the exact price inside the higher-timeframe pivot candle. Use confirmed data only.")
+int confirmationLeftBars = input.int(5, "Confirmation bars on the left", minval = 1, maxval = 50, group = confirmationGroup)
+int confirmationRightBars = input.int(5, "Confirmation bars on the right", minval = 1, maxval = 50, group = confirmationGroup, tooltip = "The higher-timeframe pivot is confirmed after this many later bars close. Its bonus is available at the first chart bar close after that confirmation.")
+float confirmationBonus = input.float(2.0, "Confirmation score bonus", minval = 0.0, step = 0.5, group = confirmationGroup, tooltip = "Add this bonus once when the same pivot is confirmed on the higher timeframe. Zero disables the bonus. Earlier entries do not receive the bonus.")
+
 string entryGroup = "Entry conditions"
 int natrPeriod = input.int(14, "NATR period", minval = 1, maxval = 5000, group = entryGroup)
 float natrDisableThreshold = input.float(1.1, "NATR disable threshold, %", minval = 0.0, step = 0.1, group = entryGroup, tooltip = "Block entries when NATR closes at or below this value.")
@@ -47,11 +53,17 @@ int riskSlippageTicks = input.int(0, "Stop slippage, ticks", minval = 0, group =
 type PivotScore
     int nearby = 0
     float proximity = 0.0
+    float confirmation = 0.0
     float total = 0.0
 
 type PivotVolatility
     float atr
     float natr
+
+type PivotConfirmation
+    float price
+    int openTime
+    int closeTime
 
 // side: -1 = low, 1 = high. knownAt is the pivot confirmation bar.
 type Pivot
@@ -59,6 +71,8 @@ type Pivot
     int index
     int side
     int knownAt
+    int openTime
+    int closeTime
     PivotVolatility volatility
     PivotScore score
 
@@ -68,14 +82,14 @@ type PivotNeighbor
 
 f_pivot_append(array<Pivot> pivots, float price, int span, int side, bool confirmed, int index, float atr, float natr) =>
     if confirmed and not na(price)
-        array.push(pivots, Pivot.new(price, index - span, side, index, PivotVolatility.new(atr, natr), PivotScore.new()))
+        array.push(pivots, Pivot.new(price, index - span, side, index, time[span], time_close[span], PivotVolatility.new(atr, natr), PivotScore.new()))
 
-f_pivot_price(float source, simple int span, simple int side) =>
-    float candidate = source[span]
+f_pivot_price(float source, simple int leftBars, simple int rightBars, simple int side) =>
+    float candidate = source[rightBars]
     bool valid = not na(candidate)
     bool hasStrictNeighbor = false
     if valid
-        for offset = 0 to span * 2
+        for offset = 0 to leftBars + rightBars
             float neighbor = source[offset]
             if na(neighbor)
                 valid := false
@@ -96,12 +110,47 @@ f_pivot_pruneWindow(array<Pivot> pivots, int firstIndex) =>
         array.shift(pivots)
 
 f_pivot_collectHigh(array<Pivot> highPivots, float source, simple int span, bool confirmed, int index, float atr, float natr) =>
-    float price = f_pivot_price(source, span, 1)
+    float price = f_pivot_price(source, span, span, 1)
     f_pivot_append(highPivots, price, span, 1, confirmed, index, atr[span], natr[span])
 
 f_pivot_collectLow(array<Pivot> lowPivots, float source, simple int span, bool confirmed, int index, float atr, float natr) =>
-    float price = f_pivot_price(source, span, -1)
+    float price = f_pivot_price(source, span, span, -1)
     f_pivot_append(lowPivots, price, span, -1, confirmed, index, atr[span], natr[span])
+
+f_pivot_closed(simple int leftBars, simple int rightBars) =>
+    float highPrice = f_pivot_price(high, leftBars, rightBars, 1)
+    float lowPrice = f_pivot_price(low, leftBars, rightBars, -1)
+    // Offset every field so the open higher-timeframe bar cannot change the result.
+    [highPrice[1], lowPrice[1], time[rightBars + 1], time_close[rightBars + 1], time_close[1]]
+
+f_confirmation_update(array<PivotConfirmation> confirmations, float price, int openTime, int closeTime, int firstTime) =>
+    if not na(price) and not na(openTime) and not na(closeTime)
+        array.push(confirmations, PivotConfirmation.new(price, openTime, closeTime))
+
+    while array.size(confirmations) > 0
+        if na(firstTime) or array.get(confirmations, 0).closeTime > firstTime
+            break
+        array.shift(confirmations)
+
+f_pivot_scoreConfirmation(array<Pivot> pivots, array<PivotConfirmation> confirmations, float bonus) =>
+    int confirmationIndex = 0
+    int count = array.size(confirmations)
+    if bonus > 0
+        // Both arrays are chronological. Keep one forward cursor for the whole scan.
+        for point in pivots
+            if point.score.confirmation > 0
+                continue
+            while confirmationIndex < count
+                PivotConfirmation candidate = array.get(confirmations, confirmationIndex)
+                if point.openTime >= candidate.closeTime
+                    confirmationIndex += 1
+                    continue
+
+                bool sameCandle = point.openTime >= candidate.openTime and point.closeTime <= candidate.closeTime
+                // Compare the difference so small prices are not rounded to equality.
+                if sameCandle and int(math.sign(point.price - candidate.price)) == 0
+                    point.score.confirmation := bonus
+                break
 
 f_pivot_findNeighbors(Pivot point, array<Pivot> levels, array<int> sortedIndices, int sortedPosition, float factor) =>
     array<PivotNeighbor> neighbors = array.new<PivotNeighbor>()
@@ -137,14 +186,14 @@ f_pivot_scoreProximity(Pivot point, array<PivotNeighbor> neighbors, float factor
 
 f_pivot_scoreTotal(array<Pivot> levels) =>
     for point in levels
-        point.score.total := point.score.nearby + point.score.proximity
+        point.score.total := point.score.nearby + point.score.proximity + point.score.confirmation
 
 f_pivot_scoreNearby(array<Pivot> pivots, array<Pivot> levels, float factor) =>
     // Scores use current levels, not a snapshot from the confirmation bar.
     for point in pivots
         point.score.nearby := 0
         point.score.proximity := 0.0
-        point.score.total := 0.0
+        point.score.total := point.score.confirmation
 
     int count = array.size(levels)
     if count > 1
@@ -169,13 +218,13 @@ f_pivot_searchTooltip(Pivot point, float factor) =>
     float radius = atrReady ? factor * point.volatility.atr : na
     "NEIGHBOR SEARCH\nOwn max distance: " + f_pivot_tooltipNumber(radius) + "\nLower bound: " + f_pivot_tooltipNumber(point.price - radius) + "\nUpper bound: " + f_pivot_tooltipNumber(point.price + radius)
 
-f_pivot_scoresTooltip(Pivot point, float minimumScore) =>
-    "SCORE\nNearby pivots: " + str.tostring(point.score.nearby) + "\nProximity score: " + f_pivot_tooltipNumber(point.score.proximity) + "\nTotal score: " + f_pivot_tooltipNumber(point.score.total) + "\nMinimum line score: " + f_pivot_tooltipNumber(minimumScore)
+f_pivot_scoresTooltip(Pivot point, float minimumScore, string higherTimeframe) =>
+    "SCORE\nNearby pivots: " + str.tostring(point.score.nearby) + "\nProximity score: " + f_pivot_tooltipNumber(point.score.proximity) + "\nConfirmation score (" + higherTimeframe + "): " + f_pivot_tooltipNumber(point.score.confirmation) + "\nTotal score: " + f_pivot_tooltipNumber(point.score.total) + "\nMinimum line score: " + f_pivot_tooltipNumber(minimumScore)
 
-f_pivot_tooltip(Pivot point, float factor, float minimumScore) =>
+f_pivot_tooltip(Pivot point, float factor, float minimumScore, string higherTimeframe) =>
     string natrText = na(point.volatility.natr) ? "N/A" : f_pivot_tooltipNumber(point.volatility.natr) + "%"
     string details = "Price: " + f_pivot_tooltipNumber(point.price) + "\nATR: " + f_pivot_tooltipNumber(point.volatility.atr) + "\nNATR: " + natrText
-    details + "\n\n" + f_pivot_searchTooltip(point, factor) + "\n\n" + f_pivot_scoresTooltip(point, minimumScore)
+    details + "\n\n" + f_pivot_searchTooltip(point, factor) + "\n\n" + f_pivot_scoresTooltip(point, minimumScore, higherTimeframe)
 
 f_level_isCovered(Pivot point, float candleLow, float candleHigh) =>
     bool covered = false
@@ -265,6 +314,9 @@ if natrEnableThreshold <= natrDisableThreshold
 if timeframe.in_seconds(selectedTrendTimeframe) < timeframe.in_seconds()
     runtime.error("Trend timeframe must be equal to or higher than the chart timeframe.")
 
+if timeframe.in_seconds(confirmationTimeframe) <= timeframe.in_seconds()
+    runtime.error("Confirmation timeframe must be higher than the chart timeframe.")
+
 // Fill recalculations set exits only. Historical OHLC must not create entry signals here.
 varip float previousPositionSize = 0.0
 varip int previousClosedTrades = 0
@@ -326,11 +378,25 @@ var array<Pivot> highPivots = array.new<Pivot>()
 var array<Pivot> lowPivots = array.new<Pivot>()
 var array<Pivot> activeHighLevels = array.new<Pivot>()
 var array<Pivot> activeLowLevels = array.new<Pivot>()
+var array<PivotConfirmation> highConfirmations = array.new<PivotConfirmation>()
+var array<PivotConfirmation> lowConfirmations = array.new<PivotConfirmation>()
+var int lastConfirmationTime = na
+[confirmedHigh, confirmedLow, confirmedOpenTime, confirmedCloseTime, confirmedKnownAt] = request.security(syminfo.tickerid, confirmationTimeframe, f_pivot_closed(confirmationLeftBars, confirmationRightBars), gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_on)
 f_pivot_collectHigh(highPivots, high, pivotSpan, evaluateBar, bar_index, natrAtr, natrValue)
 f_pivot_collectLow(lowPivots, low, pivotSpan, evaluateBar, bar_index, natrAtr, natrValue)
 if evaluateBar
     f_pivot_pruneWindow(highPivots, bar_index - historyBars + 1)
     f_pivot_pruneWindow(lowPivots, bar_index - historyBars + 1)
+
+    int firstTime = time[math.min(bar_index, historyBars - 1)]
+    bool newConfirmation = not na(confirmedKnownAt) and confirmedKnownAt <= time and (na(lastConfirmationTime) or confirmedKnownAt > lastConfirmationTime)
+    f_confirmation_update(highConfirmations, newConfirmation ? confirmedHigh : na, confirmedOpenTime, confirmedCloseTime, firstTime)
+    f_confirmation_update(lowConfirmations, newConfirmation ? confirmedLow : na, confirmedOpenTime, confirmedCloseTime, firstTime)
+    if newConfirmation
+        lastConfirmationTime := confirmedKnownAt
+
+    f_pivot_scoreConfirmation(highPivots, highConfirmations, confirmationBonus)
+    f_pivot_scoreConfirmation(lowPivots, lowConfirmations, confirmationBonus)
 
 if filterCoveredLevels and evaluateBar
     f_pivot_pruneWindow(activeHighLevels, bar_index - historyBars + 1)
@@ -476,7 +542,7 @@ if not orderFilled and (barstate.islastconfirmedhistory or barstate.islast)
         bool isHigh = lowPivotIndex < 0 or (highPivotIndex >= 0 and array.get(highPivots, highPivotIndex).index >= array.get(lowPivots, lowPivotIndex).index)
         Pivot point = isHigh ? array.get(highPivots, highPivotIndex) : array.get(lowPivots, lowPivotIndex)
         color markerColor = isHigh ? color.red : color.teal
-        array.push(drawnPivotDetails, label.new(point.index, point.price, text = "", xloc = xloc.bar_index, yloc = yloc.price, color = markerColor, style = label.style_diamond, size = size.tiny, tooltip = f_pivot_tooltip(point, nearbyAtrFactor, minimumTotalScore)))
+        array.push(drawnPivotDetails, label.new(point.index, point.price, text = "", xloc = xloc.bar_index, yloc = yloc.price, color = markerColor, style = label.style_diamond, size = size.tiny, tooltip = f_pivot_tooltip(point, nearbyAtrFactor, minimumTotalScore, confirmationTimeframe)))
 
         if isHigh
             highPivotIndex -= 1
